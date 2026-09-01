@@ -82,6 +82,10 @@ def get_or_create_worksheet() -> gspread.Worksheet:
         if missing:
             start_col = len(first_row) + 1
             end_col = start_col + len(missing) - 1
+            if ws.col_count < end_col:
+                # сама таблица физически ещё не такая широкая — расширяем сетку,
+                # иначе Google Sheets откажет с "exceeds grid limits"
+                ws.resize(cols=end_col)
             cell_range = (
                 f"{gspread.utils.rowcol_to_a1(1, start_col)}:"
                 f"{gspread.utils.rowcol_to_a1(1, end_col)}"
