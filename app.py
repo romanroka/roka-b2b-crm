@@ -152,7 +152,7 @@ with tab_clients:
             "Choisir un client", shown["id"].tolist() if not shown.empty else [], key="edit_select"
         )
         if client_id:
-            client = sheets.get_client_by_id(int(client_id))
+            client = sheets.get_client_by_id(int(client_id), df=df)
             with st.form("edit_client_form"):
                 c1, c2 = st.columns(2)
                 with c1:
@@ -282,22 +282,23 @@ with tab_prospecting:
             st.write(f"**{len(to_add)}** sélectionné(s) sur {len(edited)} trouvé(s).")
 
             if st.button("➕ Ajouter les prospects sélectionnés", disabled=to_add.empty):
-                added = 0
-                for _, row in to_add.iterrows():
-                    sheets.append_client(
-                        {
-                            "company": row["Entreprise"],
-                            "sector": row["Secteur"] if row["Secteur"] in config.SECTORS else "Autre",
-                            "city": row["Ville"],
-                            "website": row["Site web"],
-                            "email": row["Email"],
-                            "phone": row["Téléphone"],
-                            "source": "Prospection automatique (recherche IA)",
-                            "notes": f"[Recherche auto à {st.session_state.get('prospect_city', '')}] {row['Notes']}",
-                        }
-                    )
-                    added += 1
-                st.success(f"{added} prospect(s) ajouté(s) à la base, statut « Nouveau ».")
+                rows_to_add = [
+                    {
+                        "company": row["Entreprise"],
+                        "sector": row["Secteur"] if row["Secteur"] in config.SECTORS else "Autre",
+                        "city": row["Ville"],
+                        "website": row["Site web"],
+                        "email": row["Email"],
+                        "phone": row["Téléphone"],
+                        "source": "Prospection automatique (recherche IA)",
+                        "notes": f"[Recherche auto à {st.session_state.get('prospect_city', '')}] {row['Notes']}",
+                    }
+                    for _, row in to_add.iterrows()
+                ]
+                # un seul appel à l'API pour tout le lot — évite d'épuiser le quota
+                # Google Sheets quand on ajoute plusieurs prospects d'un coup
+                new_ids = sheets.append_clients(rows_to_add)
+                st.success(f"{len(new_ids)} prospect(s) ajouté(s) à la base, statut « Nouveau ».")
                 del st.session_state["prospect_results"]
                 refresh()
                 st.rerun()
@@ -321,6 +322,7 @@ with tab_scoring:
 
         if not to_score.empty and st.button("⚡ Scorer tous les clients en attente"):
             results = []
+            updates_by_id = {}
             for _, row in to_score.iterrows():
                 res = scoring.score_client(row.to_dict())
                 new_status = (
@@ -328,16 +330,16 @@ with tab_scoring:
                     else "Non pertinent" if res.label == "Pas fit ❌"
                     else "À qualifier"
                 )
-                sheets.update_client(
-                    int(row["id"]),
-                    {
-                        "fit_score": res.score,
-                        "fit_label": res.label,
-                        "fit_reasoning": res.reasoning,
-                        "status": new_status,
-                    },
-                )
+                updates_by_id[int(row["id"])] = {
+                    "fit_score": res.score,
+                    "fit_label": res.label,
+                    "fit_reasoning": res.reasoning,
+                    "status": new_status,
+                }
                 results.append({"id": row["id"], "company": row["company"], "score": res.score, "label": res.label})
+            # un seul appel à l'API pour tout le lot — évite d'épuiser le quota
+            # Google Sheets quand il y a beaucoup de clients à scorer d'un coup
+            sheets.update_clients(updates_by_id)
             st.success(f"{len(results)} client(s) scoré(s).")
             st.dataframe(pd.DataFrame(results), hide_index=True, use_container_width=True)
             refresh()
@@ -346,7 +348,7 @@ with tab_scoring:
         st.markdown("**Scorer un client précis**")
         client_id = st.selectbox("Client", df["id"].tolist(), key="score_select")
         if client_id:
-            client = sheets.get_client_by_id(int(client_id))
+            client = sheets.get_client_by_id(int(client_id), df=df)
             st.write(f"Secteur : {client['sector']} · Zone : {client['region']} · "
                       f"Volume : {client['volume_potential']} · Sensibilité prix : {client['price_sensitivity']}")
             if st.button("Calculer le score"):
@@ -394,7 +396,7 @@ with tab_letters:
             "Client", eligible["id"].tolist(),
             format_func=lambda i: f"{i} — {eligible[eligible['id'] == i]['company'].values[0]}",
         )
-        client = sheets.get_client_by_id(int(client_id))
+        client = sheets.get_client_by_id(int(client_id), df=df)
 
         if st.button("✍️ Générer la lettre"):
             with st.spinner("Génération en cours…"):
@@ -470,7 +472,7 @@ with tab_relance:
                 "Client à relancer", pool["id"].tolist(),
                 format_func=lambda i: f"{i} — {pool[pool['id'] == i]['company'].values[0]}",
             )
-            client = sheets.get_client_by_id(int(client_id))
+            client = sheets.get_client_by_id(int(client_id), df=df)
 
             if st.button("✍️ Générer la relance"):
                 with st.spinner("Génération en cours…"):
