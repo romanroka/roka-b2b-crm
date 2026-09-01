@@ -20,7 +20,10 @@ def _get_anthropic_client() -> anthropic.Anthropic:
         raise RuntimeError(
             "ANTHROPIC_API_KEY не задан. Добавь его в .env (см. README, шаг 5)."
         )
-    return anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+       default_headers = None
+    if config.ANTHROPIC_WORKSPACE_ID:
+        default_headers = {"anthropic-workspace-id": config.ANTHROPIC_WORKSPACE_ID}
+    return anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, default_headers=default_headers)
 
 
 def _client_context(client: dict) -> str:
