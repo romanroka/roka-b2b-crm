@@ -217,13 +217,31 @@ with tab_prospecting:
     with c2:
         prospect_max = st.number_input("Nombre max", min_value=1, max_value=20, value=10)
 
+    prospect_sectors = st.multiselect(
+        "Secteurs à cibler",
+        [s for s in config.SECTORS if s != "Autre"],
+        default=[s for s in config.SECTORS if s != "Autre"],
+        help="Décoche les secteurs que tu ne veux pas prospecter cette fois-ci.",
+    )
+    prospect_nearby = st.checkbox(
+        "Élargir aussi aux environs / communes voisines (pas seulement le centre-ville)",
+        value=True,
+    )
+
     if st.button("🔍 Chercher des prospects"):
         if not prospect_city.strip():
             st.warning("Indique une ville.")
+        elif not prospect_sectors:
+            st.warning("Choisis au moins un secteur.")
         else:
             with st.spinner(f"Recherche en cours à {prospect_city}… (peut prendre 30 à 60 secondes)"):
                 try:
-                    results = prospecting.find_prospects(prospect_city.strip(), int(prospect_max))
+                    results = prospecting.find_prospects(
+                        prospect_city.strip(),
+                        int(prospect_max),
+                        sectors=prospect_sectors,
+                        include_nearby=prospect_nearby,
+                    )
                     st.session_state["prospect_results"] = results
                     st.session_state["prospect_city"] = prospect_city.strip()
                 except Exception as e:

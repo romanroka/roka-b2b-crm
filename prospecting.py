@@ -22,7 +22,14 @@ from letters import _get_anthropic_client, _web_search_tools, _extract_text
 PROSPECT_FIELDS = ["company", "sector", "city", "website", "email", "phone", "notes"]
 
 
-def _sectors_for_search() -> list:
+def _sectors_for_search(sectors: list = None) -> list:
+    """Si des secteurs précis sont donnés, on les utilise (en gardant l'ordre
+    et en ignorant "Autre" et tout ce qui n'existe pas dans config.SECTORS).
+    Sinon, on retombe sur tous les secteurs cibles par défaut."""
+    if sectors:
+        valid = [s for s in sectors if s in config.SECTORS and s != "Autre"]
+        if valid:
+            return valid
     return [s for s in config.SECTORS if s != "Autre"] or list(config.SECTORS)
 
 
@@ -40,26 +47,48 @@ def _extract_json_array(text: str) -> list:
     return data if isinstance(data, list) else []
 
 
-def find_prospects(city: str, max_results: int = 10) -> list:
+def find_prospects(
+    city: str,
+    max_results: int = 10,
+    sectors: list = None,
+    include_nearby: bool = True,
+) -> list:
     """
     Cherche sur le web de VRAIES entreprises à `city` correspondant aux
-    secteurs cibles (config.SECTORS), et renvoie une liste de dicts avec les
-    clés PROSPECT_FIELDS — prête à être affichée pour validation avant ajout.
+    secteurs choisis (ou, par défaut, tous les secteurs cibles de
+    config.SECTORS), et renvoie une liste de dicts avec les clés
+    PROSPECT_FIELDS — prête à être affichée pour validation avant ajout.
+
+    sectors : liste de secteurs à cibler (doivent exister dans config.SECTORS).
+              Si vide/None, cherche dans tous les secteurs cibles par défaut.
+    include_nearby : si True (par défaut), élargit aussi aux communes /
+              zones voisines de `city` (utile pour les petites villes), pas
+              seulement à la ville exacte.
     """
     city = (city or "").strip()
     if not city:
         return []
 
     max_results = max(1, min(int(max_results), 20))
-    sectors_txt = ", ".join(_sectors_for_search())
+    sectors_txt = ", ".join(_sectors_for_search(sectors))
+
+    if include_nearby:
+        zone_instructions = (
+            f"Cherche à {city} ET dans son agglomération / ses environs proches "
+            "(communes voisines, même département ou région immédiate) — pas "
+            "seulement dans le centre-ville exact, pour avoir un choix plus large."
+        )
+    else:
+        zone_instructions = f"Cherche STRICTEMENT à {city} même, pas dans les villes voisines."
 
     system_prompt = f"""Tu es un assistant de prospection B2B pour cette entreprise :
 
 {config.BRAND_CONTEXT}
 
 Ta tâche : utiliser la recherche web pour trouver de VRAIES entreprises
-existantes à {city} (ou dans ses environs proches si peu de résultats sur
-place), qui correspondent à l'un de ces secteurs cibles : {sectors_txt}.
+existantes qui correspondent à l'un de ces secteurs cibles : {sectors_txt}.
+
+{zone_instructions}
 
 Règles impératives :
 - N'invente JAMAIS une entreprise, un site web, un email ou un téléphone.
