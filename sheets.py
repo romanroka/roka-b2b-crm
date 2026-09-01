@@ -12,6 +12,7 @@
     get_client_by_id(id)       -> dict с данными одного клиента (или None)
 """
 
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -26,6 +27,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+# Streamlit relance TOUT le script à chaque clic/interaction — donc sans cache,
+# ouvrir la feuille (client.open + vérif des en-têtes) est refait à chaque fois,
+# pour chaque fonction qui en a besoin. Ça consomme le quota Google Sheets API
+# ("429 Quota exceeded") très vite dès qu'il y a plusieurs actions d'affilée.
+# On garde donc le classeur en cache quelques secondes au niveau du module.
+_WS_CACHE_TTL_SECONDS = 20
+_ws_cache = {"ws": None, "ts": 0.0}
 
 
 def get_gspread_client() -> gspread.Client:
@@ -52,7 +61,15 @@ def get_gspread_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def get_or_create_worksheet() -> gspread.Worksheet:
+def get_or_create_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+    now = time.time()
+    if (
+        not force_refresh
+        and _ws_cache["ws"] is not None
+        and (now - _ws_cache["ts"]) < _WS_CACHE_TTL_SECONDS
+    ):
+        return _ws_cache["ws"]
+
     client = get_gspread_client()
     try:
         sheet = client.open(config.GOOGLE_SHEET_NAME)
@@ -60,6 +77,41 @@ def get_or_create_worksheet() -> gspread.Worksheet:
         raise RuntimeError(
             f"Google-таблица '{config.GOOGLE_SHEET_NAME}' не найдена. "
             "Создай её вручную и дай доступ сервис-аккаунту (см. README, шаг 3)."
+        ) from exc
+    except gspread.exceptions.APIError as exc:
+        # Streamlit часто обрезает/прячет исходный текст ошибки от gspread,
+        # поэтому вытаскиваем код и текст ответа Google API вручную, чтобы
+        # было видно, ЧТО именно случилось (лимит запросов, права доступа и т.п.)
+        status = None
+        body_text = ""
+        try:
+            status = exc.response.status_code
+            body_text = exc.response.text[:500]
+        except Exception:
+            pass
+
+        if status == 429:
+            hint = (
+                "Google Sheets API временно ограничил количество запросов "
+                "(слишком много обращений подряд). Подожди 1-2 минуты и обнови "
+                "страницу — обычно само проходит."
+            )
+        elif status == 403:
+            hint = (
+                "Нет доступа к таблице. Проверь, что таблица "
+                f"'{config.GOOGLE_SHEET_NAME}' расшарена именно на email "
+                "сервис-аккаунта (client_email из Secrets), с правом Editor."
+            )
+        elif status == 404:
+            hint = (
+                f"Таблица '{config.GOOGLE_SHEET_NAME}' не найдена сервис-аккаунтом "
+                "— проверь точное название и что доступ дан."
+            )
+        else:
+            hint = "См. код и текст ответа Google ниже."
+
+        raise RuntimeError(
+            f"Ошибка Google Sheets API (код {status}). {hint}\n\nОтвет Google: {body_text}"
         ) from exc
 
     try:
@@ -92,6 +144,8 @@ def get_or_create_worksheet() -> gspread.Worksheet:
             )
             ws.update(cell_range, [missing])
 
+    _ws_cache["ws"] = ws
+    _ws_cache["ts"] = now
     return ws
 
 
@@ -114,25 +168,44 @@ def _next_id(df: pd.DataFrame) -> int:
     return int(df["id"].max()) + 1
 
 
-def append_client(data: dict) -> int:
-    """Добавляет клиента. data может содержать только часть полей — остальные пустые."""
-    df = load_clients_df()
-    new_id = _next_id(df)
+def append_clients(data_list: list) -> list:
+    """
+    Ajoute plusieurs clients en UN SEUL appel à l'API (une lecture pour les id,
+    une écriture pour toutes les lignes) — à utiliser dès qu'on ajoute plus
+    d'un client d'un coup (ex: import de prospects), pour éviter d'épuiser le
+    quota Google Sheets avec des appels répétés.
+    Renvoie la liste des id attribués, dans le même ordre que data_list.
+    """
+    if not data_list:
+        return []
 
-    row = {col: "" for col in config.CLIENT_COLUMNS}
-    row.update(data)
-    row["id"] = new_id
-    row.setdefault("date_added", datetime.now().strftime("%Y-%m-%d"))
-    if not row.get("status"):
-        row["status"] = "Nouveau"
-    if not row.get("date_added"):
-        row["date_added"] = datetime.now().strftime("%Y-%m-%d")
-    row["relance_count"] = row.get("relance_count") or 0
+    df = load_clients_df()
+    next_id = _next_id(df)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    ordered_rows = []
+    new_ids = []
+    for data in data_list:
+        row = {col: "" for col in config.CLIENT_COLUMNS}
+        row.update(data)
+        row["id"] = next_id
+        if not row.get("status"):
+            row["status"] = "Nouveau"
+        if not row.get("date_added"):
+            row["date_added"] = today
+        row["relance_count"] = row.get("relance_count") or 0
+        ordered_rows.append([row.get(col, "") for col in config.CLIENT_COLUMNS])
+        new_ids.append(next_id)
+        next_id += 1
 
     ws = get_or_create_worksheet()
-    ordered_row = [row.get(col, "") for col in config.CLIENT_COLUMNS]
-    ws.append_row(ordered_row, value_input_option="USER_ENTERED")
-    return new_id
+    ws.append_rows(ordered_rows, value_input_option="USER_ENTERED")
+    return new_ids
+
+
+def append_client(data: dict) -> int:
+    """Добавляет одного клиента. Для нескольких сразу — используй append_clients()."""
+    return append_clients([data])[0]
 
 
 def _find_row_number(ws: gspread.Worksheet, client_id: int) -> Optional[int]:
@@ -147,32 +220,67 @@ def _find_row_number(ws: gspread.Worksheet, client_id: int) -> Optional[int]:
     return None
 
 
-def update_client(client_id: int, updates: dict) -> bool:
-    """Обновляет только переданные поля (updates = {column_name: value}) для клиента с client_id."""
+def update_clients(updates_by_id: dict) -> int:
+    """
+    Met à jour plusieurs clients en UN SEUL appel à l'API (une lecture pour
+    localiser les lignes, une écriture pour tous les changements) — à utiliser
+    dès qu'on met à jour plusieurs clients d'un coup (ex: "Scorer tous les
+    clients en attente"), pour éviter d'épuiser le quota Google Sheets.
+    updates_by_id = {client_id: {colonne: valeur, ...}, ...}
+    Renvoie le nombre de clients effectivement trouvés et mis à jour.
+    """
+    if not updates_by_id:
+        return 0
+
     ws = get_or_create_worksheet()
-    row_number = _find_row_number(ws, client_id)
-    if row_number is None:
-        return False
+    id_col_index = config.CLIENT_COLUMNS.index("id") + 1
+    col_values = ws.col_values(id_col_index)
+    row_by_id = {}
+    for i, val in enumerate(col_values):
+        if i == 0:
+            continue  # заголовок
+        try:
+            row_by_id[int(str(val).strip())] = i + 1
+        except ValueError:
+            continue
 
     cell_updates = []
-    for col_name, value in updates.items():
-        if col_name not in config.CLIENT_COLUMNS:
+    updated_count = 0
+    for client_id, updates in updates_by_id.items():
+        row_number = row_by_id.get(int(client_id))
+        if row_number is None:
             continue
-        col_index = config.CLIENT_COLUMNS.index(col_name) + 1
-        cell_updates.append(
-            {
-                "range": gspread.utils.rowcol_to_a1(row_number, col_index),
-                "values": [[value]],
-            }
-        )
+        updated_count += 1
+        for col_name, value in updates.items():
+            if col_name not in config.CLIENT_COLUMNS:
+                continue
+            col_index = config.CLIENT_COLUMNS.index(col_name) + 1
+            cell_updates.append(
+                {
+                    "range": gspread.utils.rowcol_to_a1(row_number, col_index),
+                    "values": [[value]],
+                }
+            )
 
     if cell_updates:
         ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
-    return True
+    return updated_count
 
 
-def get_client_by_id(client_id: int) -> Optional[dict]:
-    df = load_clients_df()
+def update_client(client_id: int, updates: dict) -> bool:
+    """Обновляет одного клиента. Для нескольких сразу — используй update_clients()."""
+    return update_clients({client_id: updates}) > 0
+
+
+def get_client_by_id(client_id: int, df: Optional[pd.DataFrame] = None) -> Optional[dict]:
+    """
+    Если df передан (например уже загруженный и закэшированный в app.py) —
+    используем его вместо нового обращения к Google Sheets. Это сильно
+    снижает число запросов: Streamlit заново выполняет весь скрипт при любом
+    клике, а без этого каждая вкладка дёргала бы API отдельно на каждый клик.
+    """
+    if df is None:
+        df = load_clients_df()
     if df.empty:
         return None
     match = df[df["id"] == client_id]
