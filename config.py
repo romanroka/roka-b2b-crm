@@ -21,6 +21,7 @@ CLIENTS_WORKSHEET = "Clients"
 # Claude API (генерация писем)
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_WORKSPACE_ID = os.getenv("ANTHROPIC_WORKSPACE_ID", "")
 # Если модель устарела/переименована — поменяй здесь.
 # Актуальный список: https://docs.claude.com/en/docs/about-claude/models
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
