@@ -8,8 +8,15 @@
     get_or_create_worksheet()  -> gspread.Worksheet (создаёт лист с заголовками, если его нет)
     load_clients_df()          -> pandas.DataFrame со всеми клиентами
     append_client(data)        -> добавляет новую строку, возвращает присвоенный id
+    append_clients(list)       -> то же самое, но пачкой (один запрос к API)
     update_client(id, updates) -> обновляет только переданные поля для клиента с этим id
+    update_clients(dict)       -> то же самое, но для нескольких клиентов сразу
     get_client_by_id(id)       -> dict с данными одного клиента (или None)
+
+    Второй лист "Recherches" — история поисков прослойки (вкладка Prospection):
+    log_prospect_search(...)     -> записывает одну строку поиска, возвращает её номер
+    update_search_log_added(...) -> дозаполняет колонку "ajoutes" для этой строки
+    load_search_log_df()         -> pandas.DataFrame с историей поисков
 """
 
 import time
@@ -32,9 +39,18 @@ SCOPES = [
 # ouvrir la feuille (client.open + vérif des en-têtes) est refait à chaque fois,
 # pour chaque fonction qui en a besoin. Ça consomme le quota Google Sheets API
 # ("429 Quota exceeded") très vite dès qu'il y a plusieurs actions d'affilée.
-# On garde donc le classeur en cache quelques secondes au niveau du module.
-_WS_CACHE_TTL_SECONDS = 20
+# On garde donc le classeur (Spreadsheet) en cache quelques secondes.
+_SHEET_CACHE_TTL_SECONDS = 20
+_sheet_cache = {"sheet": None, "ts": 0.0}
 _ws_cache = {"ws": None, "ts": 0.0}
+_search_log_ws_cache = {"ws": None, "ts": 0.0}
+
+# Historique des recherches de prospection (onglet "Prospection") — un second
+# onglet dans la même Google Sheet, pour garder trace de ce qui a déjà été
+# cherché (ville, secteurs, date) et ne pas s'y perdre au bout de plusieurs
+# semaines d'utilisation.
+SEARCH_LOG_WORKSHEET = "Recherches"
+SEARCH_LOG_COLUMNS = ["date", "city", "sectors", "elargi_environs", "trouves", "ajoutes"]
 
 
 def get_gspread_client() -> gspread.Client:
@@ -61,14 +77,14 @@ def get_gspread_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def get_or_create_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+def _get_spreadsheet(force_refresh: bool = False):
     now = time.time()
     if (
         not force_refresh
-        and _ws_cache["ws"] is not None
-        and (now - _ws_cache["ts"]) < _WS_CACHE_TTL_SECONDS
+        and _sheet_cache["sheet"] is not None
+        and (now - _sheet_cache["ts"]) < _SHEET_CACHE_TTL_SECONDS
     ):
-        return _ws_cache["ws"]
+        return _sheet_cache["sheet"]
 
     client = get_gspread_client()
     try:
@@ -114,6 +130,22 @@ def get_or_create_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
             f"Ошибка Google Sheets API (код {status}). {hint}\n\nОтвет Google: {body_text}"
         ) from exc
 
+    _sheet_cache["sheet"] = sheet
+    _sheet_cache["ts"] = now
+    return sheet
+
+
+def get_or_create_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+    now = time.time()
+    if (
+        not force_refresh
+        and _ws_cache["ws"] is not None
+        and (now - _ws_cache["ts"]) < _SHEET_CACHE_TTL_SECONDS
+    ):
+        return _ws_cache["ws"]
+
+    sheet = _get_spreadsheet(force_refresh)
+
     try:
         ws = sheet.worksheet(config.CLIENTS_WORKSHEET)
     except gspread.WorksheetNotFound:
@@ -147,6 +179,68 @@ def get_or_create_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
     _ws_cache["ws"] = ws
     _ws_cache["ts"] = now
     return ws
+
+
+def get_or_create_search_log_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+    """Onglet séparé 'Recherches' — historique des recherches de prospection."""
+    now = time.time()
+    if (
+        not force_refresh
+        and _search_log_ws_cache["ws"] is not None
+        and (now - _search_log_ws_cache["ts"]) < _SHEET_CACHE_TTL_SECONDS
+    ):
+        return _search_log_ws_cache["ws"]
+
+    sheet = _get_spreadsheet(force_refresh)
+
+    try:
+        ws = sheet.worksheet(SEARCH_LOG_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(
+            title=SEARCH_LOG_WORKSHEET, rows=1000, cols=len(SEARCH_LOG_COLUMNS)
+        )
+        ws.append_row(SEARCH_LOG_COLUMNS)
+
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(SEARCH_LOG_COLUMNS)
+
+    _search_log_ws_cache["ws"] = ws
+    _search_log_ws_cache["ts"] = now
+    return ws
+
+
+def log_prospect_search(city: str, sectors: list, nearby: bool, found_count: int, added_count: int = 0) -> int:
+    """Enregistre une recherche de prospection dans l'onglet 'Recherches', pour
+    garder une trace de ce qui a déjà été cherché (ville, secteurs, date).
+    Renvoie le numéro de la ligne créée (utile pour mettre à jour "ajoutes"
+    plus tard, quand l'utilisateur valide l'ajout — voir update_search_log_added)."""
+    ws = get_or_create_search_log_worksheet()
+    row_number = len(ws.get_all_values()) + 1
+    row = [
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        city,
+        ", ".join(sectors) if sectors else "(tous les secteurs)",
+        "oui" if nearby else "non",
+        found_count,
+        added_count,
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+    return row_number
+
+
+def update_search_log_added(row_number: int, added_count: int) -> None:
+    """Met à jour la colonne 'ajoutes' d'une ligne déjà loggée (voir log_prospect_search)."""
+    ws = get_or_create_search_log_worksheet()
+    col_index = SEARCH_LOG_COLUMNS.index("ajoutes") + 1
+    ws.update_cell(row_number, col_index, added_count)
+
+
+def load_search_log_df() -> pd.DataFrame:
+    ws = get_or_create_search_log_worksheet()
+    records = ws.get_all_records()
+    df = pd.DataFrame(records, columns=SEARCH_LOG_COLUMNS)
+    return df
 
 
 def load_clients_df() -> pd.DataFrame:

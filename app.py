@@ -211,6 +211,27 @@ with tab_prospecting:
         "que tu n'as pas coché puis validé les résultats ci-dessous."
     )
 
+    with st.expander("🗂 Historique des recherches (pour ne pas repasser deux fois au même endroit)"):
+        try:
+            log_df = sheets.load_search_log_df()
+        except Exception as e:
+            log_df = pd.DataFrame()
+            st.caption(f"Historique indisponible pour l'instant : {e}")
+
+        if log_df.empty:
+            st.caption("Aucune recherche encore enregistrée — ton historique apparaîtra ici.")
+        else:
+            st.dataframe(
+                log_df.iloc[::-1].rename(
+                    columns={
+                        "date": "Date", "city": "Ville", "sectors": "Secteurs",
+                        "elargi_environs": "Environs inclus", "trouves": "Trouvés", "ajoutes": "Ajoutés",
+                    }
+                ),
+                hide_index=True, use_container_width=True,
+            )
+            st.caption("**Villes déjà couvertes** : " + ", ".join(sorted(log_df["city"].astype(str).str.strip().unique())))
+
     c1, c2 = st.columns([3, 1])
     with c1:
         prospect_city = st.text_input("Ville à prospecter", placeholder="ex : Lyon")
@@ -244,6 +265,11 @@ with tab_prospecting:
                     )
                     st.session_state["prospect_results"] = results
                     st.session_state["prospect_city"] = prospect_city.strip()
+                    # on garde une trace de cette recherche (ville, secteurs, date) pour
+                    # pouvoir s'y retrouver plus tard — voir l'historique ci-dessus.
+                    st.session_state["prospect_log_row"] = sheets.log_prospect_search(
+                        prospect_city.strip(), prospect_sectors, prospect_nearby, len(results)
+                    )
                 except Exception as e:
                     st.error(f"Erreur lors de la recherche : {e}")
 
@@ -316,8 +342,12 @@ with tab_prospecting:
                 # un seul appel à l'API pour tout le lot — évite d'épuiser le quota
                 # Google Sheets quand on ajoute plusieurs prospects d'un coup
                 new_ids = sheets.append_clients(rows_to_add)
+                log_row = st.session_state.get("prospect_log_row")
+                if log_row:
+                    sheets.update_search_log_added(log_row, len(new_ids))
                 st.success(f"{len(new_ids)} prospect(s) ajouté(s) à la base, statut « Nouveau ».")
                 del st.session_state["prospect_results"]
+                st.session_state.pop("prospect_log_row", None)
                 refresh()
                 st.rerun()
 
