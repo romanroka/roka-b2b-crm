@@ -121,28 +121,44 @@ Signature à utiliser :
 
 
 def generate_relance(client: dict) -> str:
+    is_after_samples = (client.get("status") or "").strip() == "RDV / Échantillons"
+
+    if is_after_samples:
+        context_instructions = """
+Contexte précis de cette relance : des ÉCHANTILLONS de café ont déjà été
+envoyés à ce prospect (pas seulement un email). Le but de cet email est de
+prendre des nouvelles de son avis sur les échantillons reçus — est-ce qu'ils
+lui sont bien parvenus, qu'en a-t-il pensé, serait-il partant pour la suite
+(un appel, une première commande...). Ne parle pas d'un "email resté sans
+réponse" — parle des échantillons."""
+    else:
+        context_instructions = """
+Contexte précis de cette relance : un email de prise de contact a été envoyé
+et est resté sans réponse. Reviens vers le prospect sans le culpabiliser."""
+
     system_prompt = f"""Tu écris des emails de relance B2B pour ROKA.
 
 {config.BRAND_CONTEXT}
+{context_instructions}
 
 Règles impératives :
 - Écris en français, ton amical, léger, jamais culpabilisant ("je me permets
   de revenir vers vous" plutôt que "vous n'avez pas répondu").
 - Très court : 50 à 80 mots.
-- Rappelle en une phrase le sujet du premier email, sans le recopier en entier.
+- Rappelle en une phrase le sujet du message précédent, sans le recopier en entier.
 - Propose une porte de sortie simple ("dites-moi si ce n'est pas le bon
   moment, ou si vous préférez que je revienne plus tard").
 - Signe avec le nom, le rôle et l'email fournis.
 - Ne mets pas d'objet d'email, uniquement le corps du message.
 - Réponds uniquement avec le texte de l'email, sans commentaire ni balises."""
 
-    previous_letter = client.get("letter_text") or "(email précédent non disponible)"
+    previous_letter = client.get("letter_text") or "(message précédent non disponible)"
 
     user_prompt = f"""Informations sur le prospect :
 
 {_client_context(client)}
 
-Voici le premier email déjà envoyé, pour référence (ne pas le recopier) :
+Voici le dernier message déjà envoyé, pour référence (ne pas le recopier) :
 ---
 {previous_letter}
 ---

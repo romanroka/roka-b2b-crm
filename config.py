@@ -109,7 +109,7 @@ STATUSES = [
     "Non pertinent",        # не fit, не тратим время
 ]
 
-OPEN_STATUSES_FOR_RELANCE = ["Contacté", "Relance envoyée"]
+OPEN_STATUSES_FOR_RELANCE = ["Contacté", "Relance envoyée", "RDV / Échantillons"]
 
 # ---------------------------------------------------------------------------
 # Справочники полей, не зависящие от клиента
@@ -162,6 +162,10 @@ FIT_THRESHOLD_MAYBE = 40  # >= это, но < YES -> "À creuser" (промеж�
 # Реланс
 # ---------------------------------------------------------------------------
 RELANCE_DELAY_DAYS = int(os.getenv("RELANCE_DELAY_DAYS", "4"))
+# Отдельная задержка для клиентов, которым отправили пробники (échantillons) —
+# обычно нужно чуть больше времени, чем на обычное письмо, чтобы попробовать
+# кофе и составить мнение.
+SAMPLE_RELANCE_DELAY_DAYS = int(os.getenv("SAMPLE_RELANCE_DELAY_DAYS", "5"))
 
 # ---------------------------------------------------------------------------
 # Колонки листа "Clients" — порядок задаёт порядок столбцов в Google Sheet.

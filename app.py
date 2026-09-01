@@ -493,7 +493,10 @@ with tab_letters:
 # TAB: Relances
 # ---------------------------------------------------------------------------
 with tab_relance:
-    st.subheader(f"Relances (par défaut {config.RELANCE_DELAY_DAYS} jours après le dernier contact)")
+    st.subheader(
+        f"Relances (par défaut {config.RELANCE_DELAY_DAYS} jours après un email, "
+        f"{config.SAMPLE_RELANCE_DELAY_DAYS} jours après l'envoi d'échantillons)"
+    )
 
     if df.empty:
         st.info("Pas encore de client.")
@@ -506,8 +509,14 @@ with tab_relance:
 
         st.write(f"**{len(due_today)}** client(s) à relancer aujourd'hui (ou en retard).")
         if not due_today.empty:
+            due_today_display = due_today.copy()
+            due_today_display["Motif"] = due_today_display["status"].map(
+                lambda s: "📦 Échantillons envoyés" if s == "RDV / Échantillons" else "✉️ Email sans réponse"
+            )
             st.dataframe(
-                due_today[["id", "company", "status", "last_contact_date", "next_relance_date", "relance_count"]],
+                due_today_display[
+                    ["id", "company", "Motif", "last_contact_date", "next_relance_date", "relance_count"]
+                ],
                 hide_index=True, use_container_width=True,
             )
 
@@ -522,6 +531,24 @@ with tab_relance:
             )
             client = sheets.get_client_by_id(int(client_id), df=df)
 
+            st.markdown("**Tu viens d'envoyer des échantillons à ce client ?**")
+            if st.button("📦 Marquer échantillons envoyés"):
+                sheets.update_client(
+                    int(client_id),
+                    {
+                        "status": "RDV / Échantillons",
+                        "last_contact_date": today_str(),
+                        "next_relance_date": add_days(today_str(), config.SAMPLE_RELANCE_DELAY_DAYS),
+                    },
+                )
+                st.success(
+                    f"Noté. Relance programmée dans {config.SAMPLE_RELANCE_DELAY_DAYS} jours "
+                    "pour avoir son avis sur les échantillons."
+                )
+                refresh()
+                st.rerun()
+
+            st.divider()
             if st.button("✍️ Générer la relance"):
                 with st.spinner("Génération en cours…"):
                     try:
