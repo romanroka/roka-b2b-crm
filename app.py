@@ -78,6 +78,11 @@ with tab_clients:
                 email = st.text_input("Email")
                 phone = st.text_input("Téléphone")
                 city = st.text_input("Ville")
+                website = st.text_input(
+                    "Site web (optionnel)",
+                    placeholder="https://...",
+                    help="Aide Claude à trouver la bonne entreprise en cherchant sur le web pour personnaliser la lettre.",
+                )
             with c2:
                 sector = st.selectbox("Secteur", config.SECTORS)
                 region = st.selectbox("Zone", list(config.REGION_SCORE.keys()))
@@ -101,6 +106,7 @@ with tab_clients:
                             "email": email,
                             "phone": phone,
                             "city": city,
+                            "website": website,
                             "sector": sector,
                             "region": region,
                             "source": source,
@@ -174,6 +180,7 @@ with tab_clients:
                         if client["price_sensitivity"] in config.PRICE_SENSITIVITY else 0,
                     )
                     e_notes = st.text_area("Notes", value=client.get("notes", ""))
+                    e_website = st.text_input("Site web (optionnel)", value=client.get("website", ""))
 
                 if st.form_submit_button("Enregistrer"):
                     sheets.update_client(
@@ -185,6 +192,7 @@ with tab_clients:
                             "volume_potential": e_volume,
                             "price_sensitivity": e_price,
                             "notes": e_notes,
+                            "website": e_website,
                         },
                     )
                     st.success("Client mis à jour.")

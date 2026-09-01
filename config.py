@@ -21,6 +21,9 @@ CLIENTS_WORKSHEET = "Clients"
 # Claude API (генерация писем)
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Нужен только для новых "identity-linked" ключей Claude Console, которые
+# требуют явно указывать ID рабочего пространства (workspace). Если твой
+# ключ работает без этого — просто оставь пустым.
 ANTHROPIC_WORKSPACE_ID = os.getenv("ANTHROPIC_WORKSPACE_ID", "")
 # Если модель устарела/переименована — поменяй здесь.
 # Актуальный список: https://docs.claude.com/en/docs/about-claude/models
@@ -163,4 +166,15 @@ CLIENT_COLUMNS = [
     "last_contact_date",
     "next_relance_date",
     "relance_count",
+    "website",  # optionnel — aide Claude à trouver la bonne entreprise en cherchant sur le web
 ]
+
+# ---------------------------------------------------------------------------
+# Recherche web pendant la génération des lettres
+# ---------------------------------------------------------------------------
+# Si activé, Claude peut chercher sur internet des infos réelles sur l'entreprise
+# (actualités, description, avis...) avant d'écrire — pour une lettre bien plus
+# personnalisée. Coûte un peu plus cher par lettre (recherches web facturées en plus)
+# et prend quelques secondes de plus. Mets à False pour revenir au mode rapide/gratuit.
+ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "true").lower() in ("1", "true", "yes")
+WEB_SEARCH_MAX_USES = int(os.getenv("WEB_SEARCH_MAX_USES", "3"))

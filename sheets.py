@@ -74,6 +74,19 @@ def get_or_create_worksheet() -> gspread.Worksheet:
     first_row = ws.row_values(1)
     if not first_row:
         ws.append_row(config.CLIENT_COLUMNS)
+    else:
+        # если в коде появились новые колонки (например "website"), которых
+        # ещё нет в уже существующей таблице — дописываем их в конец строки
+        # заголовков, ничего не переставляя и не удаляя.
+        missing = [c for c in config.CLIENT_COLUMNS if c not in first_row]
+        if missing:
+            start_col = len(first_row) + 1
+            end_col = start_col + len(missing) - 1
+            cell_range = (
+                f"{gspread.utils.rowcol_to_a1(1, start_col)}:"
+                f"{gspread.utils.rowcol_to_a1(1, end_col)}"
+            )
+            ws.update(cell_range, [missing])
 
     return ws
 
