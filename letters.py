@@ -20,8 +20,10 @@ def _get_anthropic_client() -> anthropic.Anthropic:
         raise RuntimeError(
             "ANTHROPIC_API_KEY не задан. Добавь его в .env (см. README, шаг 5)."
         )
-       default_headers = None
+    default_headers = None
     if config.ANTHROPIC_WORKSPACE_ID:
+        # Некоторые ключи из Claude Console ("identity-linked") требуют явно
+        # указывать ID рабочего пространства в заголовке запроса.
         default_headers = {"anthropic-workspace-id": config.ANTHROPIC_WORKSPACE_ID}
     return anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, default_headers=default_headers)
 
