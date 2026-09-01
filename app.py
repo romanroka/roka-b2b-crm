@@ -14,10 +14,11 @@ import streamlit as st
 
 import config
 import letters
+import prospecting
 import scoring
 import sheets
 
-st.set_page_config(page_title="ROKA B2B CRM", page_icon="☕", layout="wide")
+st.set_page_config(page_title=config.APP_TITLE, page_icon=config.APP_ICON, layout="wide")
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +41,7 @@ def add_days(date_str: str, days: int) -> str:
     return (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
-st.title("☕ ROKA — B2B CRM (MVP)")
+st.title(f"{config.APP_ICON} {config.APP_TITLE}")
 
 try:
     df = load_data()
@@ -54,8 +55,8 @@ except Exception as e:
     )
     st.stop()
 
-tab_clients, tab_scoring, tab_letters, tab_relance, tab_dashboard = st.tabs(
-    ["📋 Clients", "🎯 Scoring", "✉️ Lettres", "🔁 Relances", "📊 Dashboard"]
+tab_clients, tab_prospecting, tab_scoring, tab_letters, tab_relance, tab_dashboard = st.tabs(
+    ["📋 Clients", "🔎 Prospection", "🎯 Scoring", "✉️ Lettres", "🔁 Relances", "📊 Dashboard"]
 )
 
 # ---------------------------------------------------------------------------
@@ -198,6 +199,108 @@ with tab_clients:
                     st.success("Client mis à jour.")
                     refresh()
                     st.rerun()
+
+# ---------------------------------------------------------------------------
+# TAB: Prospection (recherche automatique de prospects par ville)
+# ---------------------------------------------------------------------------
+with tab_prospecting:
+    st.subheader("Chercher automatiquement des prospects par ville")
+    st.caption(
+        "Claude cherche sur le web de vraies entreprises dans la ville indiquée, "
+        "parmi les secteurs cibles configurés. Rien n'est ajouté à la base tant "
+        "que tu n'as pas coché puis validé les résultats ci-dessous."
+    )
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        prospect_city = st.text_input("Ville à prospecter", placeholder="ex : Lyon")
+    with c2:
+        prospect_max = st.number_input("Nombre max", min_value=1, max_value=20, value=10)
+
+    if st.button("🔍 Chercher des prospects"):
+        if not prospect_city.strip():
+            st.warning("Indique une ville.")
+        else:
+            with st.spinner(f"Recherche en cours à {prospect_city}… (peut prendre 30 à 60 secondes)"):
+                try:
+                    results = prospecting.find_prospects(prospect_city.strip(), int(prospect_max))
+                    st.session_state["prospect_results"] = results
+                    st.session_state["prospect_city"] = prospect_city.strip()
+                except Exception as e:
+                    st.error(f"Erreur lors de la recherche : {e}")
+
+    if "prospect_results" in st.session_state:
+        results = st.session_state["prospect_results"]
+        if not results:
+            st.info(
+                "Aucun prospect trouvé avec certitude pour cette ville. Essaie une "
+                "ville plus grande, ou élargis la liste des secteurs dans la config."
+            )
+        else:
+            existing_names = (
+                set(df["company"].astype(str).str.strip().str.lower()) if not df.empty else set()
+            )
+
+            preview_rows = []
+            for r in results:
+                is_duplicate = r["company"].strip().lower() in existing_names
+                notes = r["notes"]
+                if is_duplicate:
+                    notes = (notes + "  ⚠️ déjà présent dans la base").strip()
+                preview_rows.append(
+                    {
+                        "Ajouter ?": not is_duplicate,
+                        "Entreprise": r["company"],
+                        "Secteur": r["sector"],
+                        "Ville": r["city"],
+                        "Site web": r["website"],
+                        "Email": r["email"],
+                        "Téléphone": r["phone"],
+                        "Notes": notes,
+                    }
+                )
+            preview_df = pd.DataFrame(preview_rows)
+
+            st.warning(
+                "⚠️ Les emails et téléphones trouvés par l'IA ne sont pas garantis "
+                "exacts — vérifie-les avant d'envoyer un email ou d'appeler. Le nom "
+                "de l'entreprise et le site web sont généralement plus fiables."
+            )
+
+            edited = st.data_editor(
+                preview_df,
+                hide_index=True,
+                use_container_width=True,
+                disabled=[
+                    "Entreprise", "Secteur", "Ville", "Site web", "Email", "Téléphone", "Notes",
+                ],
+                column_config={"Ajouter ?": st.column_config.CheckboxColumn("Ajouter ?")},
+                key="prospect_editor",
+            )
+
+            to_add = edited[edited["Ajouter ?"]]
+            st.write(f"**{len(to_add)}** sélectionné(s) sur {len(edited)} trouvé(s).")
+
+            if st.button("➕ Ajouter les prospects sélectionnés", disabled=to_add.empty):
+                added = 0
+                for _, row in to_add.iterrows():
+                    sheets.append_client(
+                        {
+                            "company": row["Entreprise"],
+                            "sector": row["Secteur"] if row["Secteur"] in config.SECTORS else "Autre",
+                            "city": row["Ville"],
+                            "website": row["Site web"],
+                            "email": row["Email"],
+                            "phone": row["Téléphone"],
+                            "source": "Prospection automatique (recherche IA)",
+                            "notes": f"[Recherche auto à {st.session_state.get('prospect_city', '')}] {row['Notes']}",
+                        }
+                    )
+                    added += 1
+                st.success(f"{added} prospect(s) ajouté(s) à la base, statut « Nouveau ».")
+                del st.session_state["prospect_results"]
+                refresh()
+                st.rerun()
 
 # ---------------------------------------------------------------------------
 # TAB: Scoring
