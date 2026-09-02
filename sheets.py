@@ -26,6 +26,13 @@
     log_message(id, company, type_, texte) -> добавляет одну запись в историю
     load_messages_df()                     -> pandas.DataFrame со всей историей
     get_messages_for_client(id, df=None)   -> история одного клиента
+
+    Gmail-интеграция (листы "GmailAuth", "EmailThreads", "EmailMessages"):
+    load_gmail_auth() / save_gmail_auth(dict) / disconnect_gmail()
+    load_email_threads_df() / upsert_email_threads(list)
+    get_existing_message_ids() / append_email_messages(list)
+    load_email_messages_for_thread(thread_id)
+    find_or_create_client_for_email(email, display_name)
 """
 
 import time
@@ -77,6 +84,31 @@ CONFIG_HEADER = ["cle", "valeur"]
 MESSAGES_WORKSHEET = "Messages"
 MESSAGES_COLUMNS = ["date", "client_id", "company", "type", "texte"]
 _messages_ws_cache = {"ws": None, "ts": 0.0}
+
+# ---------------------------------------------------------------------------
+# Gmail — connexion OAuth (clé/valeur, comme "Config") + historique des
+# threads et des messages importés. Voir gmail_sync.py pour toute la logique
+# d'import/synchronisation ; ce fichier ne fait que stocker/relire.
+# ---------------------------------------------------------------------------
+GMAIL_AUTH_WORKSHEET = "GmailAuth"
+GMAIL_AUTH_HEADER = ["cle", "valeur"]
+_gmail_auth_ws_cache = {"ws": None, "ts": 0.0}
+
+EMAIL_THREADS_WORKSHEET = "EmailThreads"
+EMAIL_THREADS_COLUMNS = [
+    "thread_id", "client_id", "contact_email", "subject",
+    "first_message_date", "last_inbound_date", "last_outbound_date",
+    "message_count", "ai_stage", "ai_stage_reasoning",
+    "next_action", "next_follow_up_date", "last_synced_at",
+]
+_email_threads_ws_cache = {"ws": None, "ts": 0.0}
+
+EMAIL_MESSAGES_WORKSHEET = "EmailMessages"
+EMAIL_MESSAGES_COLUMNS = [
+    "message_id", "thread_id", "direction", "date",
+    "from_email", "to_email", "subject", "body_text",
+]
+_email_messages_ws_cache = {"ws": None, "ts": 0.0}
 
 
 def get_gspread_client() -> gspread.Client:
@@ -529,3 +561,235 @@ def get_client_by_id(client_id: int, df: Optional[pd.DataFrame] = None) -> Optio
     if match.empty:
         return None
     return match.iloc[0].to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Gmail — connexion (GmailAuth)
+# ---------------------------------------------------------------------------
+def get_or_create_gmail_auth_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+    now = time.time()
+    if (
+        not force_refresh
+        and _gmail_auth_ws_cache["ws"] is not None
+        and (now - _gmail_auth_ws_cache["ts"]) < _SHEET_CACHE_TTL_SECONDS
+    ):
+        return _gmail_auth_ws_cache["ws"]
+
+    sheet = _get_spreadsheet(force_refresh)
+    try:
+        ws = sheet.worksheet(GMAIL_AUTH_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=GMAIL_AUTH_WORKSHEET, rows=20, cols=2)
+        ws.append_row(GMAIL_AUTH_HEADER)
+
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(GMAIL_AUTH_HEADER)
+
+    _gmail_auth_ws_cache["ws"] = ws
+    _gmail_auth_ws_cache["ts"] = now
+    return ws
+
+
+def load_gmail_auth() -> dict:
+    """{cle: valeur} — contient access_token, refresh_token, token_expiry,
+    email_address, last_synced_at une fois Gmail connecté. Vide si jamais
+    connecté ou après disconnect_gmail()."""
+    ws = get_or_create_gmail_auth_worksheet()
+    records = ws.get_all_records()
+    return {
+        str(r.get("cle", "")).strip(): r.get("valeur", "")
+        for r in records
+        if str(r.get("cle", "")).strip()
+    }
+
+
+def save_gmail_auth(auth: dict) -> None:
+    ws = get_or_create_gmail_auth_worksheet(force_refresh=True)
+    rows = [GMAIL_AUTH_HEADER] + [[str(k), "" if v is None else str(v)] for k, v in auth.items()]
+    ws.clear()
+    ws.update("A1", rows)
+    _gmail_auth_ws_cache["ts"] = 0.0
+
+
+def disconnect_gmail() -> None:
+    """Efface les infos de connexion Gmail (l'utilisateur devra se reconnecter)."""
+    save_gmail_auth({})
+
+
+# ---------------------------------------------------------------------------
+# Gmail — threads (EmailThreads)
+# ---------------------------------------------------------------------------
+def get_or_create_email_threads_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+    now = time.time()
+    if (
+        not force_refresh
+        and _email_threads_ws_cache["ws"] is not None
+        and (now - _email_threads_ws_cache["ts"]) < _SHEET_CACHE_TTL_SECONDS
+    ):
+        return _email_threads_ws_cache["ws"]
+
+    sheet = _get_spreadsheet(force_refresh)
+    try:
+        ws = sheet.worksheet(EMAIL_THREADS_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(
+            title=EMAIL_THREADS_WORKSHEET, rows=5000, cols=len(EMAIL_THREADS_COLUMNS)
+        )
+        ws.append_row(EMAIL_THREADS_COLUMNS)
+
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(EMAIL_THREADS_COLUMNS)
+
+    _email_threads_ws_cache["ws"] = ws
+    _email_threads_ws_cache["ts"] = now
+    return ws
+
+
+def load_email_threads_df() -> pd.DataFrame:
+    ws = get_or_create_email_threads_worksheet()
+    records = ws.get_all_records()
+    df = pd.DataFrame(records, columns=EMAIL_THREADS_COLUMNS)
+    if not df.empty:
+        df["client_id"] = pd.to_numeric(df["client_id"], errors="coerce").astype("Int64")
+        df["message_count"] = pd.to_numeric(df["message_count"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+def upsert_email_threads(threads: list) -> None:
+    """
+    threads : liste de dicts (clés = tout ou partie de EMAIL_THREADS_COLUMNS),
+    UN SEUL dict par thread_id. Met à jour les threads déjà connus et ajoute
+    les nouveaux, en UN SEUL appel de lecture + UN SEUL (ou deux : update +
+    append) appel d'écriture pour tout le lot — quel que soit le nombre de
+    threads touchés dans ce cycle de synchronisation.
+    """
+    if not threads:
+        return
+    ws = get_or_create_email_threads_worksheet()
+    existing = ws.get_all_values()  # inclut l'en-tête
+    data_rows = existing[1:] if existing else []
+    row_index_by_thread_id = {row[0]: i for i, row in enumerate(data_rows) if row}
+
+    cell_updates = []
+    new_rows = []
+    for t in threads:
+        thread_id = str(t.get("thread_id", "")).strip()
+        if not thread_id:
+            continue
+        if thread_id in row_index_by_thread_id:
+            row_number = row_index_by_thread_id[thread_id] + 2  # +1 en-tête, +1 pour 1-based
+            for col_index, col in enumerate(EMAIL_THREADS_COLUMNS, start=1):
+                if col in t:  # ne réécrit que les colonnes fournies dans ce dict
+                    cell_updates.append(
+                        {
+                            "range": gspread.utils.rowcol_to_a1(row_number, col_index),
+                            "values": [[t[col]]],
+                        }
+                    )
+        else:
+            new_rows.append([str(t.get(col, "")) for col in EMAIL_THREADS_COLUMNS])
+
+    if cell_updates:
+        ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="USER_ENTERED")
+
+
+# ---------------------------------------------------------------------------
+# Gmail — messages (EmailMessages)
+# ---------------------------------------------------------------------------
+def get_or_create_email_messages_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+    now = time.time()
+    if (
+        not force_refresh
+        and _email_messages_ws_cache["ws"] is not None
+        and (now - _email_messages_ws_cache["ts"]) < _SHEET_CACHE_TTL_SECONDS
+    ):
+        return _email_messages_ws_cache["ws"]
+
+    sheet = _get_spreadsheet(force_refresh)
+    try:
+        ws = sheet.worksheet(EMAIL_MESSAGES_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(
+            title=EMAIL_MESSAGES_WORKSHEET, rows=20000, cols=len(EMAIL_MESSAGES_COLUMNS)
+        )
+        ws.append_row(EMAIL_MESSAGES_COLUMNS)
+
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(EMAIL_MESSAGES_COLUMNS)
+
+    _email_messages_ws_cache["ws"] = ws
+    _email_messages_ws_cache["ts"] = now
+    return ws
+
+
+def get_existing_message_ids() -> set:
+    """Pour la déduplication lors d'une resynchronisation : tous les
+    message_id déjà stockés (une seule colonne lue, pas toute la feuille)."""
+    ws = get_or_create_email_messages_worksheet()
+    col_index = EMAIL_MESSAGES_COLUMNS.index("message_id") + 1
+    values = ws.col_values(col_index)
+    return set(values[1:])  # on saute l'en-tête
+
+
+def append_email_messages(messages: list) -> int:
+    """Ajoute plusieurs messages en un seul appel à l'API. `messages` doit
+    déjà avoir été filtré pour ne contenir AUCUN message_id présent dans
+    get_existing_message_ids() — c'est ce qui évite les doublons."""
+    if not messages:
+        return 0
+    ws = get_or_create_email_messages_worksheet()
+    rows = [[str(m.get(col, "")) for col in EMAIL_MESSAGES_COLUMNS] for m in messages]
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    return len(rows)
+
+
+def load_email_messages_for_thread(thread_id: str) -> pd.DataFrame:
+    """Charge tous les messages d'un thread donné, triés par date — pour
+    affichage ou pour les envoyer à l'IA (classification du stage)."""
+    ws = get_or_create_email_messages_worksheet()
+    records = ws.get_all_records()
+    df = pd.DataFrame(records, columns=EMAIL_MESSAGES_COLUMNS)
+    if df.empty:
+        return df
+    return df[df["thread_id"] == str(thread_id)].sort_values("date")
+
+
+# ---------------------------------------------------------------------------
+# Gmail — lien avec les Clients existants
+# ---------------------------------------------------------------------------
+def find_or_create_client_for_email(email_address: str, display_name: str = "") -> Optional[int]:
+    """
+    Cherche un client existant par email (colonne "email" de Clients). Si
+    aucun ne correspond, en crée un nouveau automatiquement (import Gmail)
+    avec le nom affiché comme contact et le domaine comme nom d'entreprise
+    provisoire — à corriger/compléter à la main ensuite si besoin.
+    Renvoie l'id du client (existant ou nouvellement créé), ou None si
+    email_address est vide.
+    """
+    email_address = (email_address or "").strip().lower()
+    if not email_address:
+        return None
+
+    df = load_clients_df()
+    if not df.empty:
+        match = df[df["email"].astype(str).str.strip().str.lower() == email_address]
+        if not match.empty:
+            return int(match.iloc[0]["id"])
+
+    domain = email_address.split("@")[-1] if "@" in email_address else email_address
+    guessed_company = domain.split(".")[0].capitalize() if domain else email_address
+    new_id = append_client(
+        {
+            "company": guessed_company,
+            "contact_name": display_name or email_address,
+            "email": email_address,
+            "source": "Import Gmail",
+            "notes": f"Créé automatiquement depuis Gmail (domaine : {domain}). À compléter/vérifier.",
+        }
+    )
+    return new_id

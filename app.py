@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 import config
+import gmail_sync
 import letters
 import prospecting
 import scoring
@@ -127,6 +128,22 @@ if MINIMAL_DESIGN_ENABLED:
 
 
 # ---------------------------------------------------------------------------
+# Gmail — retour de l'écran d'autorisation Google (présence de ?code=... dans
+# l'URL). On échange le code contre les tokens, on les sauvegarde, puis on
+# nettoie l'URL pour ne pas retraiter le même code à chaque rechargement.
+# ---------------------------------------------------------------------------
+if "code" in st.query_params and config.GMAIL_CLIENT_ID:
+    try:
+        _tokens = gmail_sync.exchange_code_for_tokens(st.query_params["code"])
+        sheets.save_gmail_auth(_tokens)
+        st.query_params.clear()
+        st.success("✅ Gmail connecté avec succès ! Va dans l'onglet 📧 Gmail pour lancer le premier import.")
+    except Exception as e:
+        st.query_params.clear()
+        st.error(f"Erreur lors de la connexion à Gmail : {e}")
+
+
+# ---------------------------------------------------------------------------
 # Данные — с кэшем, чтобы не дёргать Google Sheets на каждый клик
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=30, show_spinner="Chargement depuis Google Sheets…")
@@ -160,8 +177,34 @@ except Exception as e:
     )
     st.stop()
 
-tab_settings, tab_clients, tab_prospecting, tab_scoring, tab_letters, tab_relance, tab_dashboard = st.tabs(
-    ["⚙️ Paramètres", "📋 Clients", "🔎 Prospection", "🎯 Scoring", "✉️ Lettres", "🔁 Relances", "📊 Dashboard"]
+# ---------------------------------------------------------------------------
+# Gmail — synchronisation "automatique" à l'ouverture de l'appli. Le tout
+# PREMIER import (potentiellement des centaines de messages + classification
+# IA de chaque conversation) se lance à la main depuis l'onglet Gmail, pour
+# ne pas bloquer l'appli plusieurs minutes à l'ouverture sans prévenir.
+# Une fois ce premier import fait, les ouvertures suivantes resynchronisent
+# tout seules (au plus une fois toutes les GMAIL_MIN_SYNC_INTERVAL_MINUTES
+# minutes) — c'est ça, "l'automatique" possible sur un hébergement gratuit
+# qui ne fait tourner aucun processus permanent en tâche de fond.
+# ---------------------------------------------------------------------------
+try:
+    _gmail_auth = sheets.load_gmail_auth()
+except Exception:
+    _gmail_auth = {}
+
+if (
+    _gmail_auth.get("refresh_token")
+    and _gmail_auth.get("last_synced_at")
+    and gmail_sync.should_auto_sync(_gmail_auth)
+):
+    try:
+        gmail_sync.sync()
+        refresh()
+    except Exception:
+        pass  # on ne bloque jamais l'appli pour un souci de sync silencieux
+
+tab_settings, tab_clients, tab_prospecting, tab_scoring, tab_letters, tab_relance, tab_dashboard, tab_gmail = st.tabs(
+    ["⚙️ Paramètres", "📋 Clients", "🔎 Prospection", "🎯 Scoring", "✉️ Lettres", "🔁 Relances", "📊 Dashboard", "📧 Gmail"]
 )
 
 # ---------------------------------------------------------------------------
@@ -400,6 +443,28 @@ with tab_clients:
                     st.info(f"⏰ **Prochaine action prévue le {next_date}** : {motif}.")
             else:
                 st.caption("⏰ Aucune action programmée pour l'instant.")
+
+            try:
+                all_threads = sheets.load_email_threads_df()
+                client_threads = (
+                    all_threads[all_threads["client_id"] == int(client_id)]
+                    if not all_threads.empty else all_threads
+                )
+            except Exception:
+                client_threads = pd.DataFrame()
+
+            if not client_threads.empty:
+                st.markdown("**📧 Correspondance Gmail liée**")
+                for _, th in client_threads.iterrows():
+                    stage = th.get("ai_stage") or "stage non déterminé"
+                    with st.expander(f"{th.get('subject', '')} — {stage}"):
+                        next_action = th.get("next_action") or "—"
+                        next_date = th.get("next_follow_up_date") or "pas de date"
+                        st.caption(f"Prochaine action (avis de l'IA) : {next_action} ({next_date})")
+                        thread_msgs = sheets.load_email_messages_for_thread(th["thread_id"])
+                        for _, m in thread_msgs.iterrows():
+                            who = "Nous" if m["direction"] == "out" else "Eux"
+                            st.text(f"[{m['date']}] {who} : {m.get('subject', '')}\n{str(m.get('body_text', ''))[:500]}")
 
             st.divider()
             with st.form("edit_client_form"):
@@ -893,3 +958,112 @@ with tab_dashboard:
         st.metric("Clients gagnés 🏆", clients_won)
         if not scored.empty:
             st.metric("Score moyen (clients scorés)", f"{scored['fit_score'].mean():.0f}/100")
+
+# ---------------------------------------------------------------------------
+# TAB: Gmail (import automatique des emails + CRM stage déterminé par l'IA)
+# ---------------------------------------------------------------------------
+with tab_gmail:
+    st.subheader("Import automatique depuis Gmail")
+    st.caption(
+        "Connecte ta boîte Gmail pour importer l'historique des emails envoyés "
+        "et reçus (12 derniers mois au premier import), créer/lier "
+        "automatiquement les clients correspondants, et laisser l'IA "
+        "déterminer où en est chaque conversation."
+    )
+
+    if not (config.GMAIL_CLIENT_ID and config.GMAIL_CLIENT_SECRET and config.GMAIL_REDIRECT_URI):
+        st.warning(
+            "Gmail n'est pas encore configuré. Il faut d'abord créer un "
+            "identifiant OAuth (\"Application Web\") dans Google Cloud Console "
+            "et renseigner GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / "
+            "GMAIL_REDIRECT_URI dans les Secrets de l'appli — voir "
+            "GMAIL_SETUP.md pour le guide pas à pas."
+        )
+    else:
+        try:
+            gmail_auth = sheets.load_gmail_auth()
+        except Exception as e:
+            gmail_auth = {}
+            st.error(f"Impossible de lire la connexion Gmail : {e}")
+
+        connected = bool(gmail_auth.get("refresh_token"))
+
+        if not connected:
+            auth_url = gmail_sync.get_authorization_url(state="roka_crm")
+            st.link_button("🔐 Se connecter avec Google", auth_url)
+            st.caption(
+                "Tu seras redirigé vers Google pour autoriser la LECTURE SEULE "
+                "de ta boîte Gmail — aucun envoi, aucune suppression, aucune "
+                "modification n'est possible avec cet accès."
+            )
+        else:
+            last_sync = gmail_auth.get("last_synced_at", "")
+            c1, c2, c3 = st.columns([2, 1, 1])
+            with c1:
+                st.success(f"✅ Connecté : {gmail_auth.get('email_address', '')}")
+                st.caption(f"Dernière synchro : {last_sync or 'jamais — fais le premier import ci-contre'}")
+            with c2:
+                sync_label = "📥 Premier import (12 mois)" if not last_sync else "🔄 Synchroniser maintenant"
+                if st.button(sync_label):
+                    with st.spinner(
+                        "Synchronisation en cours… le premier import peut prendre "
+                        "plusieurs minutes selon le volume d'emails."
+                    ):
+                        try:
+                            result = gmail_sync.sync()
+                            st.success(
+                                f"{result['new_messages']} nouveau(x) message(s) · "
+                                f"{result['threads_updated']} conversation(s) mise(s) à jour · "
+                                f"{result['threads_classified']} classifiée(s) par l'IA."
+                            )
+                            refresh()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erreur pendant la synchronisation : {e}")
+            with c3:
+                if st.button("🔌 Déconnecter"):
+                    sheets.disconnect_gmail()
+                    st.success("Gmail déconnecté.")
+                    st.rerun()
+
+        st.divider()
+        st.markdown("**Conversations importées**")
+        try:
+            threads_df = sheets.load_email_threads_df()
+        except Exception as e:
+            threads_df = pd.DataFrame()
+            st.caption(f"Impossible de charger les conversations : {e}")
+
+        if threads_df.empty:
+            st.info("Aucune conversation importée pour l'instant.")
+        else:
+            stage_filter = st.multiselect("Filtrer par stage", config.GMAIL_CRM_STAGES, key="gmail_stage_filter")
+            shown_threads = threads_df.copy()
+            if stage_filter:
+                shown_threads = shown_threads[shown_threads["ai_stage"].isin(stage_filter)]
+
+            shown_threads = shown_threads.sort_values("last_inbound_date", ascending=False)
+            st.dataframe(
+                shown_threads[
+                    [
+                        "contact_email", "subject", "ai_stage", "next_action",
+                        "next_follow_up_date", "last_inbound_date", "last_outbound_date", "message_count",
+                    ]
+                ],
+                hide_index=True, use_container_width=True,
+            )
+
+            st.markdown("**Voir un thread en détail**")
+            thread_options = shown_threads["thread_id"].tolist()
+            if thread_options:
+                selected_thread = st.selectbox(
+                    "Conversation",
+                    thread_options,
+                    format_func=lambda tid: shown_threads[shown_threads["thread_id"] == tid]["subject"].values[0] or tid,
+                    key="gmail_thread_select",
+                )
+                thread_messages = sheets.load_email_messages_for_thread(selected_thread)
+                for _, m in thread_messages.iterrows():
+                    who = "📤 Nous" if m["direction"] == "out" else "📥 Eux"
+                    with st.expander(f"{m['date']} — {who} — {m.get('subject', '')}"):
+                        st.text(m.get("body_text", "") or "(pas de texte)")

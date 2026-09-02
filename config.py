@@ -208,3 +208,39 @@ CLIENT_COLUMNS = [
 # et prend quelques secondes de plus. Mets à False pour revenir au mode rapide/gratuit.
 ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "true").lower() in ("1", "true", "yes")
 WEB_SEARCH_MAX_USES = int(os.getenv("WEB_SEARCH_MAX_USES", "3"))
+
+# ---------------------------------------------------------------------------
+# Gmail (OAuth) — import automatique des emails envoyés/reçus pour créer et
+# tenir à jour le CRM à partir de la vraie correspondance.
+#
+# À créer une seule fois dans Google Cloud Console (voir GMAIL_SETUP.md) :
+# un identifiant OAuth "Application Web" (PAS un compte de service — celui-là
+# sert uniquement pour Google Sheets). Il faut y déclarer GMAIL_REDIRECT_URI
+# comme "URI de redirection autorisé", exactement égal à l'URL de l'appli
+# déployée + "/" (ex: https://mon-app.streamlit.app/).
+# ---------------------------------------------------------------------------
+GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID", "")
+GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET", "")
+GMAIL_REDIRECT_URI = os.getenv("GMAIL_REDIRECT_URI", "")
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+# Combien de mois d'historique importer lors de la toute première synchronisation.
+GMAIL_SYNC_MONTHS = int(os.getenv("GMAIL_SYNC_MONTHS", "12"))
+# Ne re-synchronise pas plus souvent que ça (en minutes), même si l'appli est
+# rouverte en boucle — évite de solliciter l'API Gmail et Claude inutilement.
+GMAIL_MIN_SYNC_INTERVAL_MINUTES = int(os.getenv("GMAIL_MIN_SYNC_INTERVAL_MINUTES", "15"))
+# Nombre max de messages récupérés en un seul cycle de synchronisation (pagine
+# au-delà si besoin, mais évite un premier import monstre en un seul clic).
+GMAIL_MAX_MESSAGES_PER_SYNC = int(os.getenv("GMAIL_MAX_MESSAGES_PER_SYNC", "500"))
+
+# Étapes possibles du "CRM stage" déterminé par l'IA à partir de la
+# correspondance (volontairement distinct de STATUSES : c'est un diagnostic
+# automatique, pas le statut que tu pilotes toi-même dans l'onglet Clients).
+GMAIL_CRM_STAGES = [
+    "Nouveau contact",
+    "En discussion",
+    "En attente de réponse (à relancer)",
+    "Intéressé",
+    "Pas intéressé",
+    "Conclu",
+]
