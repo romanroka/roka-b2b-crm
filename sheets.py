@@ -251,6 +251,12 @@ def load_clients_df() -> pd.DataFrame:
         return df
     # приводим числовые/строковые поля к удобному виду
     df["id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
+    # строки без валидного id (например, случайная пустая строка в таблице
+    # после ручного удаления клиентов) ломают выпадающие списки в интерфейсе
+    # (Streamlit не умеет сравнивать <NA>) — просто игнорируем такие строки.
+    df = df[df["id"].notna()].reset_index(drop=True)
+    if df.empty:
+        return df
     df["fit_score"] = pd.to_numeric(df["fit_score"], errors="coerce")
     df["relance_count"] = pd.to_numeric(df["relance_count"], errors="coerce").fillna(0).astype(int)
     return df
