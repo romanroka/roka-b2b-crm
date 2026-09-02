@@ -17,6 +17,10 @@
     log_prospect_search(...)     -> записывает одну строку поиска, возвращает её номер
     update_search_log_added(...) -> дозаполняет колонку "ajoutes" для этой строки
     load_search_log_df()         -> pandas.DataFrame с историей поисков
+
+    Третий лист "Config" — данные о бренде/компании (вкладка Paramètres):
+    load_brand_settings()        -> dict {ключ: значение}
+    save_brand_settings(dict)    -> полностью перезаписывает эти настройки
 """
 
 import time
@@ -44,6 +48,7 @@ _SHEET_CACHE_TTL_SECONDS = 20
 _sheet_cache = {"sheet": None, "ts": 0.0}
 _ws_cache = {"ws": None, "ts": 0.0}
 _search_log_ws_cache = {"ws": None, "ts": 0.0}
+_config_ws_cache = {"ws": None, "ts": 0.0}
 
 # Historique des recherches de prospection (onglet "Prospection") — un second
 # onglet dans la même Google Sheet, pour garder trace de ce qui a déjà été
@@ -51,6 +56,14 @@ _search_log_ws_cache = {"ws": None, "ts": 0.0}
 # semaines d'utilisation.
 SEARCH_LOG_WORKSHEET = "Recherches"
 SEARCH_LOG_COLUMNS = ["date", "city", "sectors", "elargi_environs", "trouves", "ajoutes"]
+
+# Informations sur l'entreprise/marque pour laquelle l'appli travaille — un
+# troisième onglet, en clé/valeur, rempli depuis l'onglet "⚙️ Paramètres" de
+# l'appli. Sert à personnaliser les emails générés par l'IA (à quoi sert
+# l'entreprise, quel produit elle vend...) sans jamais toucher au code ni aux
+# Secrets — pratique pour configurer l'appli pour un nouveau client.
+CONFIG_WORKSHEET = "Config"
+CONFIG_HEADER = ["cle", "valeur"]
 
 
 def get_gspread_client() -> gspread.Client:
@@ -241,6 +254,59 @@ def load_search_log_df() -> pd.DataFrame:
     records = ws.get_all_records()
     df = pd.DataFrame(records, columns=SEARCH_LOG_COLUMNS)
     return df
+
+
+def get_or_create_config_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+    """Onglet séparé 'Config' — infos sur l'entreprise/marque, en clé/valeur."""
+    now = time.time()
+    if (
+        not force_refresh
+        and _config_ws_cache["ws"] is not None
+        and (now - _config_ws_cache["ts"]) < _SHEET_CACHE_TTL_SECONDS
+    ):
+        return _config_ws_cache["ws"]
+
+    sheet = _get_spreadsheet(force_refresh)
+
+    try:
+        ws = sheet.worksheet(CONFIG_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=CONFIG_WORKSHEET, rows=50, cols=2)
+        ws.append_row(CONFIG_HEADER)
+
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(CONFIG_HEADER)
+
+    _config_ws_cache["ws"] = ws
+    _config_ws_cache["ts"] = now
+    return ws
+
+
+def load_brand_settings() -> dict:
+    """Renvoie {cle: valeur} depuis l'onglet 'Config'. Vide si rien n'a
+    encore été enregistré (première utilisation) — à ce moment-là, l'appli
+    retombe sur les valeurs par défaut de config.py."""
+    ws = get_or_create_config_worksheet()
+    records = ws.get_all_records()  # [{"cle": ..., "valeur": ...}, ...]
+    return {
+        str(r.get("cle", "")).strip(): r.get("valeur", "")
+        for r in records
+        if str(r.get("cle", "")).strip()
+    }
+
+
+def save_brand_settings(settings: dict) -> None:
+    """Réécrit entièrement l'onglet 'Config' avec les valeurs données.
+    Petit volume de données (une dizaine de lignes) — pas besoin d'un
+    update ligne par ligne, une réécriture complète est plus simple et fiable."""
+    ws = get_or_create_config_worksheet(force_refresh=True)
+    rows = [CONFIG_HEADER] + [[str(k), "" if v is None else str(v)] for k, v in settings.items()]
+    ws.clear()
+    ws.update("A1", rows)
+    # on force une relecture propre au prochain appel (clear() invaliderait
+    # sinon un ws caché avec l'ancienne géométrie/contenu)
+    _config_ws_cache["ts"] = 0.0
 
 
 def load_clients_df() -> pd.DataFrame:

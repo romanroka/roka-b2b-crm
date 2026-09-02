@@ -18,6 +18,52 @@ import prospecting
 import scoring
 import sheets
 
+# ---------------------------------------------------------------------------
+# Infos entreprise/marque — remplies dans l'onglet "⚙️ Paramètres" et stockées
+# dans l'onglet "Config" de la Google Sheet (pas besoin de toucher au code ni
+# aux Secrets). Tant que rien n'est encore configuré, on garde les valeurs
+# par défaut de config.py (ROKA).
+# ---------------------------------------------------------------------------
+try:
+    brand_settings = sheets.load_brand_settings()
+except Exception:
+    brand_settings = {}
+
+
+def _apply_setting(attr: str, key: str, cast=str) -> None:
+    val = brand_settings.get(key)
+    if val not in (None, ""):
+        try:
+            setattr(config, attr, cast(val))
+        except (TypeError, ValueError):
+            pass
+
+
+_apply_setting("APP_TITLE", "app_title")
+_apply_setting("APP_ICON", "app_icon")
+_apply_setting("SENDER_NAME", "sender_name")
+_apply_setting("SENDER_ROLE", "sender_role")
+_apply_setting("SENDER_EMAIL", "sender_email")
+_apply_setting("RELANCE_DELAY_DAYS", "relance_delay_days", int)
+_apply_setting("SAMPLE_RELANCE_DELAY_DAYS", "sample_relance_delay_days", int)
+
+if brand_settings.get("activity_description") or brand_settings.get("product_description"):
+    _ctx_parts = []
+    if brand_settings.get("company_name"):
+        _line = brand_settings["company_name"]
+        if brand_settings.get("tagline"):
+            _line += f" — {brand_settings['tagline']}"
+        _ctx_parts.append(_line)
+    if brand_settings.get("activity_description"):
+        _ctx_parts.append(brand_settings["activity_description"])
+    if brand_settings.get("product_description"):
+        _ctx_parts.append(f"Produit / service vendu : {brand_settings['product_description']}")
+    if brand_settings.get("target_audience"):
+        _ctx_parts.append(f"Client cible : {brand_settings['target_audience']}")
+    if brand_settings.get("tone_preferences"):
+        _ctx_parts.append(f"Ton souhaité pour les emails : {brand_settings['tone_preferences']}")
+    config.BRAND_CONTEXT = "\n".join(_ctx_parts)
+
 st.set_page_config(page_title=config.APP_TITLE, page_icon=config.APP_ICON, layout="wide")
 
 
@@ -55,9 +101,114 @@ except Exception as e:
     )
     st.stop()
 
-tab_clients, tab_prospecting, tab_scoring, tab_letters, tab_relance, tab_dashboard = st.tabs(
-    ["📋 Clients", "🔎 Prospection", "🎯 Scoring", "✉️ Lettres", "🔁 Relances", "📊 Dashboard"]
+tab_settings, tab_clients, tab_prospecting, tab_scoring, tab_letters, tab_relance, tab_dashboard = st.tabs(
+    ["⚙️ Paramètres", "📋 Clients", "🔎 Prospection", "🎯 Scoring", "✉️ Lettres", "🔁 Relances", "📊 Dashboard"]
 )
+
+# ---------------------------------------------------------------------------
+# TAB: Paramètres (infos entreprise/marque — utilisées pour personnaliser
+# les emails générés par l'IA, sans jamais toucher au code)
+# ---------------------------------------------------------------------------
+with tab_settings:
+    st.subheader("Informations sur l'entreprise / la marque")
+    st.caption(
+        "Ces infos servent à personnaliser TOUT ce que l'IA génère (les emails "
+        "de prospection et de relance) — plus c'est précis, moins les messages "
+        "sont génériques. Elles servent aussi pour le titre de l'appli et la "
+        "signature des emails."
+    )
+
+    if not (brand_settings.get("activity_description") or brand_settings.get("product_description")):
+        st.info(
+            "Pas encore configuré : pour l'instant, l'IA utilise la description "
+            "par défaut (ROKA, café spécialité) codée dans le projet. Remplis "
+            "et enregistre ce formulaire pour que les emails parlent de TON "
+            "entreprise à toi."
+        )
+
+    with st.form("brand_settings_form"):
+        st.markdown("**Marque / entreprise**")
+        f_company_name = st.text_input(
+            "Nom de l'entreprise / marque", value=brand_settings.get("company_name", "")
+        )
+        f_tagline = st.text_input("Slogan (optionnel)", value=brand_settings.get("tagline", ""))
+        f_activity = st.text_area(
+            "Que fait l'entreprise ? (activité, positionnement — 2-3 phrases)",
+            value=brand_settings.get("activity_description", ""), height=80,
+        )
+        f_product = st.text_area(
+            "Quel produit / service vend-elle exactement ?",
+            value=brand_settings.get("product_description", ""), height=80,
+        )
+        f_audience = st.text_area(
+            "À qui elle vend (client cible typique)",
+            value=brand_settings.get("target_audience", ""), height=60,
+        )
+        f_tone = st.text_area(
+            "Ton souhaité pour les emails, et ce qu'il faut éviter",
+            value=brand_settings.get("tone_preferences", ""), height=60,
+        )
+
+        st.markdown("**Application**")
+        c1, c2 = st.columns(2)
+        with c1:
+            f_app_title = st.text_input(
+                "Titre de l'application", value=brand_settings.get("app_title") or config.APP_TITLE
+            )
+        with c2:
+            f_app_icon = st.text_input(
+                "Icône (emoji)", value=brand_settings.get("app_icon") or config.APP_ICON
+            )
+
+        st.markdown("**Signature des emails**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            f_sender_name = st.text_input(
+                "Nom", value=brand_settings.get("sender_name") or config.SENDER_NAME
+            )
+        with c2:
+            f_sender_role = st.text_input(
+                "Fonction", value=brand_settings.get("sender_role") or config.SENDER_ROLE
+            )
+        with c3:
+            f_sender_email = st.text_input(
+                "Email", value=brand_settings.get("sender_email") or config.SENDER_EMAIL
+            )
+
+        st.markdown("**Délais de relance (en jours)**")
+        c1, c2 = st.columns(2)
+        with c1:
+            f_relance_days = st.number_input(
+                "Après un email sans réponse", min_value=1, max_value=30,
+                value=int(brand_settings.get("relance_delay_days") or config.RELANCE_DELAY_DAYS),
+            )
+        with c2:
+            f_sample_days = st.number_input(
+                "Après l'envoi d'échantillons", min_value=1, max_value=30,
+                value=int(brand_settings.get("sample_relance_delay_days") or config.SAMPLE_RELANCE_DELAY_DAYS),
+            )
+
+        submitted = st.form_submit_button("💾 Enregistrer")
+        if submitted:
+            sheets.save_brand_settings(
+                {
+                    "company_name": f_company_name,
+                    "tagline": f_tagline,
+                    "activity_description": f_activity,
+                    "product_description": f_product,
+                    "target_audience": f_audience,
+                    "tone_preferences": f_tone,
+                    "app_title": f_app_title,
+                    "app_icon": f_app_icon,
+                    "sender_name": f_sender_name,
+                    "sender_role": f_sender_role,
+                    "sender_email": f_sender_email,
+                    "relance_delay_days": f_relance_days,
+                    "sample_relance_delay_days": f_sample_days,
+                }
+            )
+            st.success("Enregistré ! L'appli se recharge avec ces informations…")
+            st.rerun()
 
 # ---------------------------------------------------------------------------
 # TAB: Clients
