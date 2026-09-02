@@ -222,7 +222,14 @@ WEB_SEARCH_MAX_USES = int(os.getenv("WEB_SEARCH_MAX_USES", "3"))
 GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET", "")
 GMAIL_REDIRECT_URI = os.getenv("GMAIL_REDIRECT_URI", "")
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# gmail.send permet l'envoi groupé depuis l'onglet Lettres (voir plus bas).
+# Si Gmail a été connecté AVANT l'ajout de ce scope, il faut se déconnecter
+# puis se reconnecter une fois pour que Google redemande cette autorisation —
+# l'ancien refresh_token ne l'inclut pas automatiquement.
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 
 # Combien de mois d'historique importer lors de la toute première synchronisation.
 GMAIL_SYNC_MONTHS = int(os.getenv("GMAIL_SYNC_MONTHS", "12"))
@@ -232,6 +239,16 @@ GMAIL_MIN_SYNC_INTERVAL_MINUTES = int(os.getenv("GMAIL_MIN_SYNC_INTERVAL_MINUTES
 # Nombre max de messages récupérés en un seul cycle de synchronisation (pagine
 # au-delà si besoin, mais évite un premier import monstre en un seul clic).
 GMAIL_MAX_MESSAGES_PER_SYNC = int(os.getenv("GMAIL_MAX_MESSAGES_PER_SYNC", "500"))
+
+# --- Envoi groupé ("remplace Mailmeteor") ---------------------------------
+# Pause entre deux envois (secondes) : évite de déclencher les protections
+# anti-spam de Gmail en envoyant trop de messages d'un coup, trop vite.
+GMAIL_SEND_DELAY_SECONDS = float(os.getenv("GMAIL_SEND_DELAY_SECONDS", "2"))
+# Plafond d'emails envoyés PAR JOUR par l'appli (compteur remis à zéro chaque
+# jour). Volontairement bien en dessous de la limite Gmail perso (~500/jour)
+# pour garder de la marge pour tes propres emails manuels et ne pas risquer
+# de faire flaguer le compte comme spam.
+GMAIL_SEND_DAILY_LIMIT = int(os.getenv("GMAIL_SEND_DAILY_LIMIT", "80"))
 
 # Étapes possibles du "CRM stage" déterminé par l'IA à partir de la
 # correspondance (volontairement distinct de STATUSES : c'est un diagnostic
