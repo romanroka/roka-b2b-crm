@@ -63,7 +63,31 @@ def _extract_text(message) -> str:
     return "\n".join(parts).strip()
 
 
-def generate_first_letter(client: dict) -> str:
+def _parse_subject_and_body(text: str, fallback_subject: str) -> dict:
+    """
+    Attend le format demandé dans les prompts ci-dessous :
+        SUJET: <objet>
+        ---
+        <corps du message>
+    Si Claude n'a pas respecté ce format (ça arrive), on retombe sur un objet
+    générique et on garde tout le texte comme corps — pour ne jamais bloquer
+    l'utilisateur sur un problème de parsing.
+    """
+    lines = text.strip().split("\n")
+    if lines and lines[0].strip().upper().startswith("SUJET"):
+        subject = lines[0].split(":", 1)[-1].strip().strip('"')
+        rest_lines = lines[1:]
+        if rest_lines and rest_lines[0].strip() == "---":
+            rest_lines = rest_lines[1:]
+        body = "\n".join(rest_lines).strip()
+        if subject and body:
+            return {"subject": subject, "body": body}
+    return {"subject": fallback_subject, "body": text.strip()}
+
+
+def generate_first_letter(client: dict) -> dict:
+    """Renvoie {"subject": ..., "body": ...} — les deux personnalisés pour ce
+    client précis par Claude en un seul appel."""
     search_instructions = ""
     if config.ENABLE_WEB_SEARCH:
         search_instructions = """
@@ -91,13 +115,17 @@ Règles impératives :
   de "offre limitée dans le temps".
 - Personnalise vraiment en t'appuyant sur le secteur, la ville et le contexte
   du destinataire — évite les formules génériques.
-- Longueur : 100 à 150 mots maximum.
+- Longueur du corps : 100 à 150 mots maximum.
 - Termine par une proposition simple et sans pression (ex: envoyer quelques
   échantillons, ou proposer un court échange de 10 minutes).
 - Signe avec le nom, le rôle et l'email fournis, sans les inventer.
-- Ne mets pas d'objet d'email, uniquement le corps du message.
-- Réponds uniquement avec le texte final de l'email, sans commentaire ni balises,
-  sans mentionner que tu as fait une recherche."""
+- L'objet de l'email doit être court (moins de 60 caractères), personnalisé
+  (mentionne l'entreprise ou son secteur/ville — jamais générique), et donner
+  envie d'ouvrir sans être putaclic ni écrit en majuscules.
+- Réponds STRICTEMENT dans ce format, rien avant ni après :
+SUJET: <objet ici>
+---
+<corps du message ici, sans le recopier ni le commenter>"""
 
     user_prompt = f"""Voici les informations sur le prospect à contacter :
 
@@ -117,10 +145,13 @@ Signature à utiliser :
         tools=_web_search_tools(config.WEB_SEARCH_MAX_USES),
         messages=[{"role": "user", "content": user_prompt}],
     )
-    return _extract_text(message)
+    text = _extract_text(message)
+    fallback_subject = f"ROKA — café spécialité pour {client.get('company', '')}".strip()
+    return _parse_subject_and_body(text, fallback_subject)
 
 
-def generate_relance(client: dict) -> str:
+def generate_relance(client: dict) -> dict:
+    """Renvoie {"subject": ..., "body": ...}."""
     is_after_samples = (client.get("status") or "").strip() == "RDV / Échantillons"
 
     if is_after_samples:
@@ -149,8 +180,12 @@ Règles impératives :
 - Propose une porte de sortie simple ("dites-moi si ce n'est pas le bon
   moment, ou si vous préférez que je revienne plus tard").
 - Signe avec le nom, le rôle et l'email fournis.
-- Ne mets pas d'objet d'email, uniquement le corps du message.
-- Réponds uniquement avec le texte de l'email, sans commentaire ni balises."""
+- L'objet doit être court (moins de 60 caractères) et personnalisé (mentionne
+  l'entreprise), différent de l'objet du premier message si possible.
+- Réponds STRICTEMENT dans ce format, rien avant ni après :
+SUJET: <objet ici>
+---
+<corps du message ici, sans le recopier ni le commenter>"""
 
     previous_letter = client.get("letter_text") or "(message précédent non disponible)"
 
@@ -177,4 +212,6 @@ Signature à utiliser :
         tools=_web_search_tools(max_uses=1),
         messages=[{"role": "user", "content": user_prompt}],
     )
-    return _extract_text(message)
+    text = _extract_text(message)
+    fallback_subject = f"ROKA — un petit mot de plus, {client.get('company', '')}".strip()
+    return _parse_subject_and_body(text, fallback_subject)

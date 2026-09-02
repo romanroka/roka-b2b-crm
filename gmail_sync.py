@@ -28,9 +28,14 @@ Fonctions publiques principales :
 """
 
 import base64
+import html
 import json
 import re
+import time
 from datetime import datetime, timedelta, timezone
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.utils import parseaddr
 
 import pandas as pd
@@ -200,6 +205,186 @@ def _get_message(access_token: str, message_id: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _build_raw_message(to_email: str, subject: str, body_text: str, from_email: str = "") -> str:
+    msg = MIMEText(body_text, "plain", "utf-8")
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    if from_email:
+        sender_name = getattr(config, "SENDER_NAME", "") or ""
+        msg["From"] = f"{sender_name} <{from_email}>" if sender_name else from_email
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+
+def send_email(access_token: str, to_email: str, subject: str, body_text: str, from_email: str = "") -> dict:
+    """Envoie RÉELLEMENT un email via l'API Gmail (nécessite le scope
+    gmail.send — voir config.GMAIL_SCOPES). Renvoie la réponse Gmail (contient
+    entre autres l'id et le threadId du message envoyé)."""
+    payload = {"raw": _build_raw_message(to_email, subject, body_text, from_email)}
+    resp = requests.post(
+        f"{GMAIL_API_BASE}/messages/send",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_bulk(items: list, delay_seconds: float = None) -> dict:
+    """
+    Envoi groupé réel (remplace l'usage qui était fait de Mailmeteor) :
+    items = liste de dicts {"client_id", "to_email", "subject", "body",
+    "company"}. Chaque email est envoyé pour de vrai via le compte Gmail
+    connecté — CE N'EST PAS un brouillon.
+
+    Protections anti-spam intégrées :
+    - une pause de delay_seconds (config.GMAIL_SEND_DELAY_SECONDS par défaut)
+      entre deux envois, pour ne pas déclencher les limites de débit de Gmail ;
+    - un plafond quotidien (config.GMAIL_SEND_DAILY_LIMIT), qui prend en
+      compte les envois déjà faits aujourd'hui — au-delà, les emails
+      supplémentaires ne sont PAS envoyés (ils reviennent dans "skipped_limit"
+      pour être renvoyés le lendemain).
+
+    Renvoie {"sent": [items envoyés], "skipped_limit": [items non envoyés,
+    limite atteinte], "failed": [{"item":…, "error":…}]}.
+    """
+    auth = sheets.load_gmail_auth()
+    if not auth.get("refresh_token"):
+        raise RuntimeError("Gmail non connecté.")
+
+    access_token = _get_valid_access_token(auth)
+    own_email = (auth.get("email_address") or "").strip()
+
+    delay_seconds = config.GMAIL_SEND_DELAY_SECONDS if delay_seconds is None else delay_seconds
+    already_sent_today = sheets.get_gmail_send_count_today()
+    budget = max(0, config.GMAIL_SEND_DAILY_LIMIT - already_sent_today)
+
+    sent, skipped_limit, failed = [], [], []
+    for i, item in enumerate(items):
+        if len(sent) >= budget:
+            skipped_limit.append(item)
+            continue
+        to_email = (item.get("to_email") or "").strip()
+        if not to_email:
+            failed.append({"item": item, "error": "Email destinataire manquant."})
+            continue
+        try:
+            send_email(access_token, to_email, item.get("subject", ""), item.get("body", ""), own_email)
+            sent.append(item)
+        except Exception as e:
+            failed.append({"item": item, "error": str(e)})
+        if i < len(items) - 1:
+            time.sleep(delay_seconds)
+
+    if sent:
+        sheets.increment_gmail_send_count(len(sent))
+
+    return {"sent": sent, "skipped_limit": skipped_limit, "failed": failed}
+
+
+def _text_to_html(text: str) -> str:
+    """Convertit le texte brut d'une lettre en HTML simple (paragraphes +
+    retours à la ligne), en échappant tout caractère spécial — nécessaire
+    pour envoyer un email HTML (seul moyen d'afficher une image DANS le
+    corps du message, un lien mailto ne le permet pas)."""
+    escaped = html.escape(text or "")
+    paragraphs = [p for p in escaped.split("\n\n") if p.strip()]
+    html_paragraphs = ["<p>" + p.replace("\n", "<br>") + "</p>" for p in paragraphs]
+    return (
+        '<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; '
+        'color: #222222; line-height: 1.5;">' + "".join(html_paragraphs) + "</div>"
+    )
+
+
+def _build_raw_html_message(
+    to_email: str, subject: str, html_body: str, from_email: str = "", inline_image: dict = None
+) -> str:
+    sender_name = getattr(config, "SENDER_NAME", "") or ""
+    from_header = f"{sender_name} <{from_email}>" if (from_email and sender_name) else from_email
+
+    if inline_image:
+        msg = MIMEMultipart("related")
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        if from_header:
+            msg["From"] = from_header
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        img_bytes = base64.b64decode(inline_image["data_base64"])
+        subtype = (inline_image.get("content_type") or "image/jpeg").split("/")[-1]
+        image_part = MIMEImage(img_bytes, _subtype=subtype)
+        cid = inline_image.get("cid", "roka_image_1")
+        image_part.add_header("Content-ID", f"<{cid}>")
+        image_part.add_header(
+            "Content-Disposition", "inline", filename=inline_image.get("name", "image") + f".{subtype}"
+        )
+        msg.attach(image_part)
+    else:
+        msg = MIMEText(html_body, "html", "utf-8")
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        if from_header:
+            msg["From"] = from_header
+
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+
+def send_html_email(
+    access_token: str, to_email: str, subject: str, html_body: str, from_email: str = "", inline_image: dict = None
+) -> dict:
+    """Envoie RÉELLEMENT un email HTML via l'API Gmail, avec une image
+    optionnelle affichée DANS le corps du message (pas en pièce jointe)."""
+    payload = {"raw": _build_raw_html_message(to_email, subject, html_body, from_email, inline_image)}
+    resp = requests.post(
+        f"{GMAIL_API_BASE}/messages/send",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_single(to_email: str, subject: str, body_text: str, image: dict = None) -> dict:
+    """
+    Envoi RÉEL d'un seul email (bouton "📧 Envoyer via Gmail" de l'onglet
+    Lettres) : met le texte en forme HTML, y intègre l'image choisie si une
+    a été passée (voir sheets.get_image()), gère le rafraîchissement du
+    token, et respecte le même plafond quotidien anti-spam que l'envoi
+    groupé (config.GMAIL_SEND_DAILY_LIMIT).
+    """
+    to_email = (to_email or "").strip()
+    if not to_email:
+        raise RuntimeError("Ce client n'a pas d'email renseigné.")
+
+    auth = sheets.load_gmail_auth()
+    if not auth.get("refresh_token"):
+        raise RuntimeError("Gmail non connecté — va dans l'onglet 📧 Gmail pour te connecter.")
+
+    if sheets.get_gmail_send_count_today() >= config.GMAIL_SEND_DAILY_LIMIT:
+        raise RuntimeError(
+            f"Plafond quotidien d'envoi atteint ({config.GMAIL_SEND_DAILY_LIMIT} emails/jour, "
+            "protection anti-spam) — réessaie demain."
+        )
+
+    access_token = _get_valid_access_token(auth)
+    own_email = (auth.get("email_address") or "").strip()
+
+    html_body = _text_to_html(body_text)
+    inline_image = None
+    if image and image.get("data_base64"):
+        cid = "roka_image_1"
+        inline_image = {**image, "cid": cid}
+        html_body += (
+            f'<div style="margin-top:16px;"><img src="cid:{cid}" alt="{html.escape(image.get("name", ""))}" '
+            'style="max-width:100%;height:auto;"></div>'
+        )
+
+    result = send_html_email(access_token, to_email, subject, html_body, own_email, inline_image)
+    sheets.increment_gmail_send_count(1)
+    return result
 
 
 def _header(headers: list, name: str) -> str:

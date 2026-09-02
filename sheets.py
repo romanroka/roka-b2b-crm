@@ -383,19 +383,34 @@ def get_or_create_messages_worksheet(force_refresh: bool = False) -> gspread.Wor
     return ws
 
 
+def log_messages(entries: list) -> None:
+    """Ajoute plusieurs lignes à l'historique des messages en UN SEUL appel
+    API — à utiliser après un envoi groupé (plusieurs clients d'un coup),
+    pour ne pas épuiser le quota Google Sheets avec un append_row() par
+    message. Chaque entrée : {"client_id", "company", "type", "texte"}."""
+    if not entries:
+        return
+    ws = get_or_create_messages_worksheet()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    rows = [
+        [
+            e.get("date") or now_str,
+            e.get("client_id"),
+            e.get("company", ""),
+            e.get("type", ""),
+            e.get("texte", ""),
+        ]
+        for e in entries
+    ]
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+
 def log_message(client_id: int, company: str, type_: str, texte: str = "") -> None:
     """Ajoute une ligne à l'historique des messages envoyés — à appeler à
     chaque fois qu'un message est vraiment marqué comme envoyé (premier
-    email, relance, échantillons...), jamais pour un simple brouillon."""
-    ws = get_or_create_messages_worksheet()
-    row = [
-        datetime.now().strftime("%Y-%m-%d %H:%M"),
-        client_id,
-        company,
-        type_,
-        texte,
-    ]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    email, relance, échantillons...), jamais pour un simple brouillon.
+    Pour plusieurs messages d'un coup, utiliser log_messages()."""
+    log_messages([{"client_id": client_id, "company": company, "type": type_, "texte": texte}])
 
 
 def load_messages_df() -> pd.DataFrame:
@@ -615,6 +630,114 @@ def save_gmail_auth(auth: dict) -> None:
 def disconnect_gmail() -> None:
     """Efface les infos de connexion Gmail (l'utilisateur devra se reconnecter)."""
     save_gmail_auth({})
+
+
+def get_gmail_send_count_today() -> int:
+    """Combien d'emails l'appli a déjà envoyés AUJOURD'HUI via l'envoi groupé
+    (compteur stocké dans GmailAuth, remis à zéro dès que la date change)."""
+    auth = load_gmail_auth()
+    today = datetime.now().strftime("%Y-%m-%d")
+    if auth.get("send_count_date") != today:
+        return 0
+    try:
+        return int(auth.get("send_count_today", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def increment_gmail_send_count(n: int) -> None:
+    """Ajoute n à ce compteur du jour — appelé UNE FOIS après un envoi groupé
+    (pas par email envoyé), pour limiter les écritures Google Sheets."""
+    if n <= 0:
+        return
+    auth = load_gmail_auth()
+    today = datetime.now().strftime("%Y-%m-%d")
+    current = get_gmail_send_count_today()
+    auth["send_count_date"] = today
+    auth["send_count_today"] = current + n
+    save_gmail_auth(auth)
+
+
+# ---------------------------------------------------------------------------
+# Bibliothèque d'images (à insérer dans les emails — onglet Paramètres)
+# ---------------------------------------------------------------------------
+IMAGES_WORKSHEET = "Images"
+IMAGES_COLUMNS = ["name", "content_type", "data_base64", "added_at"]
+_images_ws_cache = {"ws": None, "ts": 0.0}
+
+
+def get_or_create_images_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+    now = time.time()
+    if (
+        not force_refresh
+        and _images_ws_cache["ws"] is not None
+        and (now - _images_ws_cache["ts"]) < _SHEET_CACHE_TTL_SECONDS
+    ):
+        return _images_ws_cache["ws"]
+
+    sheet = _get_spreadsheet(force_refresh)
+    try:
+        ws = sheet.worksheet(IMAGES_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=IMAGES_WORKSHEET, rows=200, cols=len(IMAGES_COLUMNS))
+        ws.append_row(IMAGES_COLUMNS)
+
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(IMAGES_COLUMNS)
+
+    _images_ws_cache["ws"] = ws
+    _images_ws_cache["ts"] = now
+    return ws
+
+
+def load_images_df() -> pd.DataFrame:
+    ws = get_or_create_images_worksheet()
+    records = ws.get_all_records()
+    return pd.DataFrame(records, columns=IMAGES_COLUMNS)
+
+
+def save_image(name: str, content_type: str, data_base64: str) -> None:
+    """Ajoute une image à la bibliothèque, ou remplace celle qui porte déjà
+    ce nom (upsert par nom)."""
+    ws = get_or_create_images_worksheet()
+    existing = ws.get_all_values()
+    data_rows = existing[1:] if existing else []
+    row_number = None
+    for i, row in enumerate(data_rows):
+        if row and row[0] == name:
+            row_number = i + 2  # +1 en-tête, +1 pour 1-based
+            break
+
+    new_row = [name, content_type, data_base64, datetime.now().strftime("%Y-%m-%d %H:%M")]
+    if row_number:
+        ws.update(f"A{row_number}:D{row_number}", [new_row], value_input_option="USER_ENTERED")
+    else:
+        ws.append_row(new_row, value_input_option="USER_ENTERED")
+    _images_ws_cache["ts"] = 0.0
+
+
+def delete_image(name: str) -> bool:
+    ws = get_or_create_images_worksheet()
+    existing = ws.get_all_values()
+    data_rows = existing[1:] if existing else []
+    for i, row in enumerate(data_rows):
+        if row and row[0] == name:
+            ws.delete_rows(i + 2)
+            _images_ws_cache["ts"] = 0.0
+            return True
+    return False
+
+
+def get_image(name: str) -> Optional[dict]:
+    """{"name", "content_type", "data_base64", "added_at"} ou None si absente."""
+    df = load_images_df()
+    if df.empty:
+        return None
+    match = df[df["name"] == name]
+    if match.empty:
+        return None
+    return match.iloc[0].to_dict()
 
 
 # ---------------------------------------------------------------------------

@@ -6,11 +6,14 @@ ROKA B2B CRM — MVP Streamlit.
 Инструкция по настройке — в README.md.
 """
 
+import base64
+import io
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
 import config
 import gmail_sync
@@ -18,6 +21,11 @@ import letters
 import prospecting
 import scoring
 import sheets
+
+# Taille max d'une image encodée en base64 stockée dans une cellule Google
+# Sheets (limite réelle ~50 000 caractères par cellule) — on vise large en
+# dessous pour garder de la marge.
+IMAGE_MAX_BASE64_CHARS = 42000
 
 # ---------------------------------------------------------------------------
 # Infos entreprise/marque — remplies dans l'onglet "⚙️ Paramètres" et stockées
@@ -320,6 +328,72 @@ with tab_settings:
             )
             st.success("Enregistré ! L'appli se recharge avec ces informations…")
             st.rerun()
+
+    st.divider()
+    st.subheader("🖼️ Bibliothèque d'images")
+    st.caption(
+        "Ajoute ici une fois pour toutes les images que tu veux pouvoir insérer "
+        "dans tes emails (photo produit, logo...) — ensuite, dans l'onglet "
+        "✉️ Lettres, tu choisis simplement laquelle utiliser dans une liste. "
+        "Les images sont automatiquement redimensionnées/compressées pour "
+        "rester légères (elles sont stockées dans la Google Sheet)."
+    )
+
+    with st.form("add_image_form", clear_on_submit=True):
+        img_name = st.text_input("Nom de l'image (pour la retrouver dans la liste)")
+        uploaded_img = st.file_uploader("Fichier (JPEG ou PNG)", type=["png", "jpg", "jpeg"])
+        add_img_submitted = st.form_submit_button("➕ Ajouter à la bibliothèque")
+
+    if add_img_submitted:
+        if not img_name.strip():
+            st.warning("Donne un nom à l'image.")
+        elif not uploaded_img:
+            st.warning("Choisis un fichier image.")
+        else:
+            try:
+                img = Image.open(uploaded_img).convert("RGB")
+                img.thumbnail((800, 800))
+                quality = 85
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+                # on baisse la qualité jusqu'à tenir dans une cellule Google Sheets
+                while len(buf.getvalue()) * 4 / 3 > IMAGE_MAX_BASE64_CHARS and quality > 25:
+                    quality -= 10
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=quality, optimize=True)
+                data = buf.getvalue()
+                b64 = base64.b64encode(data).decode("ascii")
+                if len(b64) > IMAGE_MAX_BASE64_CHARS:
+                    st.error(
+                        "Image trop grande même après compression — essaie une image "
+                        "plus simple, ou recadrée sur l'essentiel."
+                    )
+                else:
+                    sheets.save_image(img_name.strip(), "image/jpeg", b64)
+                    st.success(f"Image « {img_name.strip()} » ajoutée à la bibliothèque.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Erreur lors du traitement de l'image : {e}")
+
+    try:
+        images_df = sheets.load_images_df()
+    except Exception as e:
+        images_df = pd.DataFrame()
+        st.caption(f"Bibliothèque indisponible pour l'instant : {e}")
+
+    if images_df.empty:
+        st.caption("Aucune image dans la bibliothèque pour l'instant.")
+    else:
+        cols = st.columns(4)
+        for i, row in images_df.reset_index(drop=True).iterrows():
+            with cols[i % 4]:
+                try:
+                    st.image(base64.b64decode(row["data_base64"]), caption=row["name"], use_container_width=True)
+                except Exception:
+                    st.caption(f"{row['name']} (aperçu indisponible)")
+                if st.button("🗑️ Supprimer", key=f"del_img_{row['name']}"):
+                    sheets.delete_image(row["name"])
+                    st.rerun()
 
 # ---------------------------------------------------------------------------
 # TAB: Clients
@@ -746,8 +820,9 @@ with tab_scoring:
 with tab_letters:
     st.subheader("Générer une lettre de prise de contact personnalisée")
     st.caption(
-        "Générée par Claude à partir du profil du client. Relis toujours avant "
-        "d'envoyer — tu gardes la main, rien n'est envoyé automatiquement."
+        "Objet ET corps du message générés par Claude à partir du profil du "
+        "client — relis toujours avant d'envoyer. Rien ne part sans que tu "
+        "cliques explicitement sur un bouton d'envoi."
     )
 
     eligible = df[df["status"] == "À contacter"] if not df.empty else df
@@ -760,23 +835,46 @@ with tab_letters:
         )
         client = sheets.get_client_by_id(int(client_id), df=df)
 
-        if st.button("✍️ Générer la lettre"):
+        try:
+            images_df = sheets.load_images_df()
+        except Exception:
+            images_df = pd.DataFrame()
+        image_options = ["(Aucune image)"] + (images_df["name"].tolist() if not images_df.empty else [])
+        selected_image_name = st.selectbox(
+            "🖼️ Image à insérer dans l'email (optionnel)",
+            image_options,
+            help="Gère la bibliothèque d'images dans l'onglet ⚙️ Paramètres.",
+        )
+
+        if st.button("✍️ Générer la lettre (objet + texte)"):
             with st.spinner("Génération en cours…"):
                 try:
-                    text = letters.generate_first_letter(client)
-                    st.session_state["draft_letter"] = text
+                    result = letters.generate_first_letter(client)
+                    st.session_state["draft_subject"] = result["subject"]
+                    st.session_state["draft_letter"] = result["body"]
                 except Exception as e:
                     st.error(f"Erreur lors de la génération : {e}")
 
         if "draft_letter" in st.session_state:
+            edited_subject = st.text_input(
+                "Objet de l'email (modifiable, généré automatiquement)",
+                value=st.session_state.get("draft_subject", ""),
+            )
             edited = st.text_area("Texte de la lettre (modifiable)", value=st.session_state["draft_letter"], height=300)
 
-            mailto_body = quote(edited)
-            mailto_subject = quote(f"ROKA — café spécialité pour {client.get('company', '')}")
-            mail_link = f"mailto:{client.get('email', '')}?subject={mailto_subject}&body={mailto_body}"
+            has_image = selected_image_name != "(Aucune image)"
+            if has_image:
+                st.caption(
+                    "ℹ️ L'image ne s'affichera QUE si tu utilises « Envoyer via Gmail » ci-dessous "
+                    "— un lien « ouvrir dans mon client mail » ne peut techniquement pas inclure d'image."
+                )
 
-            c1, c2, c3 = st.columns(3)
+            st.markdown("**Option 1 — tu envoies toi-même**")
+            c1, c2 = st.columns(2)
             with c1:
+                mailto_body = quote(edited)
+                mailto_subject = quote(edited_subject)
+                mail_link = f"mailto:{client.get('email', '')}?subject={mailto_subject}&body={mailto_body}"
                 st.link_button("📧 Ouvrir dans mon client mail", mail_link)
             with c2:
                 if st.button("💾 Sauvegarder le brouillon"):
@@ -786,23 +884,57 @@ with tab_letters:
                     )
                     st.success("Brouillon sauvegardé (statut inchangé).")
                     refresh()
-            with c3:
-                if st.button("✅ Marquer comme envoyé"):
-                    sheets.update_client(
-                        int(client_id),
-                        {
-                            "letter_text": edited,
-                            "letter_generated_at": today_str(),
-                            "status": "Contacté",
-                            "last_contact_date": today_str(),
-                            "next_relance_date": add_days(today_str(), config.RELANCE_DELAY_DAYS),
-                        },
-                    )
-                    sheets.log_message(int(client_id), client.get("company", ""), "Premier email", edited)
-                    st.success(f"Marqué comme envoyé. Relance programmée dans {config.RELANCE_DELAY_DAYS} jours.")
-                    del st.session_state["draft_letter"]
-                    refresh()
-                    st.rerun()
+
+            if st.button("✅ Marquer comme envoyé (déjà envoyé moi-même)"):
+                sheets.update_client(
+                    int(client_id),
+                    {
+                        "letter_text": edited,
+                        "letter_generated_at": today_str(),
+                        "status": "Contacté",
+                        "last_contact_date": today_str(),
+                        "next_relance_date": add_days(today_str(), config.RELANCE_DELAY_DAYS),
+                    },
+                )
+                sheets.log_message(int(client_id), client.get("company", ""), "Premier email", edited)
+                st.success(f"Marqué comme envoyé. Relance programmée dans {config.RELANCE_DELAY_DAYS} jours.")
+                del st.session_state["draft_letter"]
+                st.session_state.pop("draft_subject", None)
+                refresh()
+                st.rerun()
+
+            st.markdown("**Option 2 — l'appli envoie pour toi, pour de vrai, via Gmail**")
+            send_label = "📧 Envoyer via Gmail" + (" (avec image)" if has_image else "")
+            if st.button(send_label, type="primary"):
+                image_payload = sheets.get_image(selected_image_name) if has_image else None
+                with st.spinner("Envoi en cours…"):
+                    try:
+                        gmail_sync.send_single(
+                            client.get("email", ""), edited_subject, edited, image=image_payload
+                        )
+                        sheets.update_client(
+                            int(client_id),
+                            {
+                                "letter_text": edited,
+                                "letter_generated_at": today_str(),
+                                "status": "Contacté",
+                                "last_contact_date": today_str(),
+                                "next_relance_date": add_days(today_str(), config.RELANCE_DELAY_DAYS),
+                            },
+                        )
+                        sheets.log_message(
+                            int(client_id), client.get("company", ""), "Premier email (envoyé via Gmail)", edited
+                        )
+                        st.success(
+                            f"✅ Email envoyé pour de vrai via Gmail. Relance programmée dans "
+                            f"{config.RELANCE_DELAY_DAYS} jours."
+                        )
+                        del st.session_state["draft_letter"]
+                        st.session_state.pop("draft_subject", None)
+                        refresh()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erreur lors de l'envoi : {e}")
 
 # ---------------------------------------------------------------------------
 # TAB: Relances
@@ -868,18 +1000,24 @@ with tab_relance:
                 st.rerun()
 
             st.divider()
-            if st.button("✍️ Générer la relance"):
+            if st.button("✍️ Générer la relance (objet + texte)"):
                 with st.spinner("Génération en cours…"):
                     try:
-                        text = letters.generate_relance(client)
-                        st.session_state["draft_relance"] = text
+                        result = letters.generate_relance(client)
+                        st.session_state["draft_relance_subject"] = result["subject"]
+                        st.session_state["draft_relance"] = result["body"]
                     except Exception as e:
                         st.error(f"Erreur lors de la génération : {e}")
 
             if "draft_relance" in st.session_state:
+                edited_relance_subject = st.text_input(
+                    "Objet de la relance (modifiable, généré automatiquement)",
+                    value=st.session_state.get("draft_relance_subject", ""),
+                    key="relance_subject_input",
+                )
                 edited = st.text_area("Texte de la relance (modifiable)", value=st.session_state["draft_relance"], height=200)
                 mailto_body = quote(edited)
-                mailto_subject = quote(f"ROKA — un petit mot de plus, {client.get('company', '')}")
+                mailto_subject = quote(edited_relance_subject)
                 mail_link = f"mailto:{client.get('email', '')}?subject={mailto_subject}&body={mailto_body}"
 
                 c1, c2 = st.columns(2)
@@ -899,8 +1037,33 @@ with tab_relance:
                         sheets.log_message(int(client_id), client.get("company", ""), "Relance", edited)
                         st.success("Relance enregistrée.")
                         del st.session_state["draft_relance"]
+                        st.session_state.pop("draft_relance_subject", None)
                         refresh()
                         st.rerun()
+
+                if st.button("📧 Envoyer cette relance via Gmail (pour de vrai)"):
+                    with st.spinner("Envoi en cours…"):
+                        try:
+                            gmail_sync.send_single(client.get("email", ""), edited_relance_subject, edited)
+                            sheets.update_client(
+                                int(client_id),
+                                {
+                                    "status": "Relance envoyée",
+                                    "last_contact_date": today_str(),
+                                    "next_relance_date": add_days(today_str(), config.RELANCE_DELAY_DAYS),
+                                    "relance_count": int(client.get("relance_count") or 0) + 1,
+                                },
+                            )
+                            sheets.log_message(
+                                int(client_id), client.get("company", ""), "Relance (envoyée via Gmail)", edited
+                            )
+                            st.success("✅ Relance envoyée pour de vrai via Gmail.")
+                            del st.session_state["draft_relance"]
+                            st.session_state.pop("draft_relance_subject", None)
+                            refresh()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erreur lors de l'envoi : {e}")
 
             st.divider()
             st.markdown("**Ou mettre à jour le statut directement** (le client a répondu, a dit non, etc.)")
