@@ -549,7 +549,10 @@ with tab_clients:
 
         st.markdown("**Modifier un client**")
         client_id = st.selectbox(
-            "Choisir un client", shown["id"].tolist() if not shown.empty else [], key="edit_select"
+            "Choisir un client",
+            shown["id"].tolist() if not shown.empty else [],
+            format_func=lambda i: f"{i} — {shown[shown['id'] == i]['company'].values[0]}",
+            key="edit_select",
         )
         if client_id:
             client = sheets.get_client_by_id(int(client_id), df=df)
@@ -606,8 +609,25 @@ with tab_clients:
 
             st.divider()
             with st.form("edit_client_form"):
+                st.markdown("**Coordonnées**")
                 c1, c2 = st.columns(2)
                 with c1:
+                    e_company = st.text_input("Entreprise", value=client.get("company", ""))
+                    e_contact_name = st.text_input("Nom du contact", value=client.get("contact_name", ""))
+                    e_contact_role = st.text_input("Fonction du contact", value=client.get("contact_role", ""))
+                    e_email = st.text_input("Email", value=client.get("email", ""))
+                with c2:
+                    e_phone = st.text_input("Téléphone", value=client.get("phone", ""))
+                    e_city = st.text_input("Ville", value=client.get("city", ""))
+                    e_source = st.selectbox(
+                        "Source du lead", config.SOURCES,
+                        index=config.SOURCES.index(client["source"]) if client.get("source") in config.SOURCES else 0,
+                    )
+                    e_website = st.text_input("Site web (optionnel)", value=client.get("website", ""))
+
+                st.markdown("**Qualification**")
+                c3, c4 = st.columns(2)
+                with c3:
                     e_status = st.selectbox(
                         "Statut", config.STATUSES,
                         index=config.STATUSES.index(client["status"]) if client["status"] in config.STATUSES else 0,
@@ -621,7 +641,7 @@ with tab_clients:
                         index=list(config.REGION_SCORE.keys()).index(client["region"])
                         if client["region"] in config.REGION_SCORE else 0,
                     )
-                with c2:
+                with c4:
                     e_volume = st.selectbox(
                         "Potentiel de volume", config.VOLUME_POTENTIAL,
                         index=config.VOLUME_POTENTIAL.index(client["volume_potential"])
@@ -633,24 +653,33 @@ with tab_clients:
                         if client["price_sensitivity"] in config.PRICE_SENSITIVITY else 0,
                     )
                     e_notes = st.text_area("Notes", value=client.get("notes", ""))
-                    e_website = st.text_input("Site web (optionnel)", value=client.get("website", ""))
 
                 if st.form_submit_button("Enregistrer"):
-                    sheets.update_client(
-                        int(client_id),
-                        {
-                            "status": e_status,
-                            "sector": e_sector,
-                            "region": e_region,
-                            "volume_potential": e_volume,
-                            "price_sensitivity": e_price,
-                            "notes": e_notes,
-                            "website": e_website,
-                        },
-                    )
-                    st.success("Client mis à jour.")
-                    refresh()
-                    st.rerun()
+                    if not e_company.strip():
+                        st.warning("Le nom de l'entreprise ne peut pas être vide.")
+                    else:
+                        sheets.update_client(
+                            int(client_id),
+                            {
+                                "company": e_company,
+                                "contact_name": e_contact_name,
+                                "contact_role": e_contact_role,
+                                "email": e_email,
+                                "phone": e_phone,
+                                "city": e_city,
+                                "source": e_source,
+                                "status": e_status,
+                                "sector": e_sector,
+                                "region": e_region,
+                                "volume_potential": e_volume,
+                                "price_sensitivity": e_price,
+                                "notes": e_notes,
+                                "website": e_website,
+                            },
+                        )
+                        st.success("Client mis à jour.")
+                        refresh()
+                        st.rerun()
 
 # ---------------------------------------------------------------------------
 # TAB: Prospection (recherche automatique de prospects par ville)
