@@ -21,6 +21,11 @@
     Третий лист "Config" — данные о бренде/компании (вкладка Paramètres):
     load_brand_settings()        -> dict {ключ: значение}
     save_brand_settings(dict)    -> полностью перезаписывает эти настройки
+
+    Четвёртый лист "Messages" — история ВСЕХ отправленных сообщений:
+    log_message(id, company, type_, texte) -> добавляет одну запись в историю
+    load_messages_df()                     -> pandas.DataFrame со всей историей
+    get_messages_for_client(id, df=None)   -> история одного клиента
 """
 
 import time
@@ -64,6 +69,14 @@ SEARCH_LOG_COLUMNS = ["date", "city", "sectors", "elargi_environs", "trouves", "
 # Secrets — pratique pour configurer l'appli pour un nouveau client.
 CONFIG_WORKSHEET = "Config"
 CONFIG_HEADER = ["cle", "valeur"]
+
+# Historique complet des messages envoyés à chaque client (un quatrième
+# onglet) — contrairement à client["letter_text"] qui ne garde que le
+# DERNIER texte généré, ceci garde TOUT l'historique (premier email, chaque
+# relance, échantillons) pour pouvoir le consulter depuis la fiche client.
+MESSAGES_WORKSHEET = "Messages"
+MESSAGES_COLUMNS = ["date", "client_id", "company", "type", "texte"]
+_messages_ws_cache = {"ws": None, "ts": 0.0}
 
 
 def get_gspread_client() -> gspread.Client:
@@ -307,6 +320,69 @@ def save_brand_settings(settings: dict) -> None:
     # on force une relecture propre au prochain appel (clear() invaliderait
     # sinon un ws caché avec l'ancienne géométrie/contenu)
     _config_ws_cache["ts"] = 0.0
+
+
+def get_or_create_messages_worksheet(force_refresh: bool = False) -> gspread.Worksheet:
+    """Onglet séparé 'Messages' — historique complet des messages envoyés."""
+    now = time.time()
+    if (
+        not force_refresh
+        and _messages_ws_cache["ws"] is not None
+        and (now - _messages_ws_cache["ts"]) < _SHEET_CACHE_TTL_SECONDS
+    ):
+        return _messages_ws_cache["ws"]
+
+    sheet = _get_spreadsheet(force_refresh)
+
+    try:
+        ws = sheet.worksheet(MESSAGES_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(
+            title=MESSAGES_WORKSHEET, rows=2000, cols=len(MESSAGES_COLUMNS)
+        )
+        ws.append_row(MESSAGES_COLUMNS)
+
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(MESSAGES_COLUMNS)
+
+    _messages_ws_cache["ws"] = ws
+    _messages_ws_cache["ts"] = now
+    return ws
+
+
+def log_message(client_id: int, company: str, type_: str, texte: str = "") -> None:
+    """Ajoute une ligne à l'historique des messages envoyés — à appeler à
+    chaque fois qu'un message est vraiment marqué comme envoyé (premier
+    email, relance, échantillons...), jamais pour un simple brouillon."""
+    ws = get_or_create_messages_worksheet()
+    row = [
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        client_id,
+        company,
+        type_,
+        texte,
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+def load_messages_df() -> pd.DataFrame:
+    ws = get_or_create_messages_worksheet()
+    records = ws.get_all_records()
+    df = pd.DataFrame(records, columns=MESSAGES_COLUMNS)
+    if not df.empty:
+        df["client_id"] = pd.to_numeric(df["client_id"], errors="coerce").astype("Int64")
+    return df
+
+
+def get_messages_for_client(client_id: int, messages_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Si messages_df est déjà chargé (recommandé, pour éviter un appel API
+    en plus), on filtre dessus. Sinon on le charge à la demande."""
+    if messages_df is None:
+        messages_df = load_messages_df()
+    if messages_df.empty:
+        return messages_df
+    return messages_df[messages_df["client_id"] == client_id].sort_values("date")
 
 
 def load_clients_df() -> pd.DataFrame:

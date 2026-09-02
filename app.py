@@ -304,6 +304,36 @@ with tab_clients:
         )
         if client_id:
             client = sheets.get_client_by_id(int(client_id), df=df)
+
+            st.markdown("**📨 Historique des messages envoyés**")
+            try:
+                client_messages = sheets.get_messages_for_client(int(client_id))
+            except Exception as e:
+                client_messages = pd.DataFrame()
+                st.caption(f"Historique indisponible pour l'instant : {e}")
+
+            if client_messages.empty:
+                st.caption("Aucun message envoyé pour l'instant à ce client.")
+            else:
+                for _, msg in client_messages.iloc[::-1].iterrows():
+                    with st.expander(f"{msg['date']} — {msg['type']}"):
+                        st.text(msg["texte"] or "(pas de texte)")
+
+            next_date = client.get("next_relance_date")
+            if next_date and str(next_date).strip():
+                motif = (
+                    "avoir son avis sur les échantillons envoyés"
+                    if client.get("status") == "RDV / Échantillons"
+                    else "relancer suite à un email sans réponse"
+                )
+                if str(next_date) <= today_str():
+                    st.warning(f"⏰ **À faire maintenant** ({next_date}) : {motif}. Voir l'onglet Relances.")
+                else:
+                    st.info(f"⏰ **Prochaine action prévue le {next_date}** : {motif}.")
+            else:
+                st.caption("⏰ Aucune action programmée pour l'instant.")
+
+            st.divider()
             with st.form("edit_client_form"):
                 c1, c2 = st.columns(2)
                 with c1:
@@ -635,6 +665,7 @@ with tab_letters:
                             "next_relance_date": add_days(today_str(), config.RELANCE_DELAY_DAYS),
                         },
                     )
+                    sheets.log_message(int(client_id), client.get("company", ""), "Premier email", edited)
                     st.success(f"Marqué comme envoyé. Relance programmée dans {config.RELANCE_DELAY_DAYS} jours.")
                     del st.session_state["draft_letter"]
                     refresh()
@@ -692,6 +723,10 @@ with tab_relance:
                         "next_relance_date": add_days(today_str(), config.SAMPLE_RELANCE_DELAY_DAYS),
                     },
                 )
+                sheets.log_message(
+                    int(client_id), client.get("company", ""), "Échantillons envoyés",
+                    "(envoi physique — pas de texte d'email)",
+                )
                 st.success(
                     f"Noté. Relance programmée dans {config.SAMPLE_RELANCE_DELAY_DAYS} jours "
                     "pour avoir son avis sur les échantillons."
@@ -728,6 +763,7 @@ with tab_relance:
                                 "relance_count": int(client.get("relance_count") or 0) + 1,
                             },
                         )
+                        sheets.log_message(int(client_id), client.get("company", ""), "Relance", edited)
                         st.success("Relance enregistrée.")
                         del st.session_state["draft_relance"]
                         refresh()
