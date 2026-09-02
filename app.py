@@ -28,13 +28,66 @@ import sheets
 IMAGE_MAX_BASE64_CHARS = 42000
 
 # ---------------------------------------------------------------------------
+# Cache — Streamlit ré-exécute TOUT le script à chaque clic, où que ce soit
+# dans l'appli (y compris le contenu des onglets non visibles à l'écran).
+# Sans cache, ça veut dire un appel Google Sheets par fonction ci-dessous À
+# CHAQUE clic, ce qui épuise vite le quota (429 "Quota exceeded"). Chaque
+# lecture est donc mise en cache 30s ; refresh() les vide toutes d'un coup
+# après une écriture, pour que l'affichage reparte à jour immédiatement.
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=30, show_spinner=False)
+def load_brand_settings_cached() -> dict:
+    return sheets.load_brand_settings()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_gmail_auth_cached() -> dict:
+    return sheets.load_gmail_auth()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_images_df_cached() -> pd.DataFrame:
+    return sheets.load_images_df()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_email_threads_df_cached() -> pd.DataFrame:
+    return sheets.load_email_threads_df()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_search_log_df_cached() -> pd.DataFrame:
+    return sheets.load_search_log_df()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_messages_df_cached() -> pd.DataFrame:
+    return sheets.load_messages_df()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_all_email_messages_df_cached() -> pd.DataFrame:
+    return sheets.load_all_email_messages_df()
+
+
+def messages_for_thread_cached(thread_id) -> pd.DataFrame:
+    """Filtre la feuille EmailMessages (chargée une seule fois, en cache) au
+    lieu de la relire entièrement à chaque thread affiché — évite d'épuiser
+    le quota Google Sheets quand un client a plusieurs conversations."""
+    all_msgs = load_all_email_messages_df_cached()
+    if all_msgs.empty:
+        return all_msgs
+    return all_msgs[all_msgs["thread_id"] == str(thread_id)].sort_values("date")
+
+
+# ---------------------------------------------------------------------------
 # Infos entreprise/marque — remplies dans l'onglet "⚙️ Paramètres" et stockées
 # dans l'onglet "Config" de la Google Sheet (pas besoin de toucher au code ni
 # aux Secrets). Tant que rien n'est encore configuré, on garde les valeurs
 # par défaut de config.py (ROKA).
 # ---------------------------------------------------------------------------
 try:
-    brand_settings = sheets.load_brand_settings()
+    brand_settings = load_brand_settings_cached()
 except Exception:
     brand_settings = {}
 
@@ -144,6 +197,7 @@ if "code" in st.query_params and config.GMAIL_CLIENT_ID:
     try:
         _tokens = gmail_sync.exchange_code_for_tokens(st.query_params["code"])
         sheets.save_gmail_auth(_tokens)
+        load_gmail_auth_cached.clear()
         st.query_params.clear()
         st.success("✅ Gmail connecté avec succès ! Va dans l'onglet 📧 Gmail pour lancer le premier import.")
     except Exception as e:
@@ -161,6 +215,13 @@ def load_data() -> pd.DataFrame:
 
 def refresh():
     load_data.clear()
+    load_brand_settings_cached.clear()
+    load_gmail_auth_cached.clear()
+    load_images_df_cached.clear()
+    load_email_threads_df_cached.clear()
+    load_search_log_df_cached.clear()
+    load_messages_df_cached.clear()
+    load_all_email_messages_df_cached.clear()
 
 
 def today_str() -> str:
@@ -196,7 +257,7 @@ except Exception as e:
 # qui ne fait tourner aucun processus permanent en tâche de fond.
 # ---------------------------------------------------------------------------
 try:
-    _gmail_auth = sheets.load_gmail_auth()
+    _gmail_auth = load_gmail_auth_cached()
 except Exception:
     _gmail_auth = {}
 
@@ -326,6 +387,7 @@ with tab_settings:
                     "minimal_design": "oui" if f_minimal_design else "non",
                 }
             )
+            load_brand_settings_cached.clear()
             st.success("Enregistré ! L'appli se recharge avec ces informations…")
             st.rerun()
 
@@ -370,13 +432,14 @@ with tab_settings:
                     )
                 else:
                     sheets.save_image(img_name.strip(), "image/jpeg", b64)
+                    load_images_df_cached.clear()
                     st.success(f"Image « {img_name.strip()} » ajoutée à la bibliothèque.")
                     st.rerun()
             except Exception as e:
                 st.error(f"Erreur lors du traitement de l'image : {e}")
 
     try:
-        images_df = sheets.load_images_df()
+        images_df = load_images_df_cached()
     except Exception as e:
         images_df = pd.DataFrame()
         st.caption(f"Bibliothèque indisponible pour l'instant : {e}")
@@ -393,6 +456,7 @@ with tab_settings:
                     st.caption(f"{row['name']} (aperçu indisponible)")
                 if st.button("🗑️ Supprimer", key=f"del_img_{row['name']}"):
                     sheets.delete_image(row["name"])
+                    load_images_df_cached.clear()
                     st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -492,7 +556,7 @@ with tab_clients:
 
             st.markdown("**📨 Historique des messages envoyés**")
             try:
-                client_messages = sheets.get_messages_for_client(int(client_id))
+                client_messages = sheets.get_messages_for_client(int(client_id), messages_df=load_messages_df_cached())
             except Exception as e:
                 client_messages = pd.DataFrame()
                 st.caption(f"Historique indisponible pour l'instant : {e}")
@@ -519,7 +583,7 @@ with tab_clients:
                 st.caption("⏰ Aucune action programmée pour l'instant.")
 
             try:
-                all_threads = sheets.load_email_threads_df()
+                all_threads = load_email_threads_df_cached()
                 client_threads = (
                     all_threads[all_threads["client_id"] == int(client_id)]
                     if not all_threads.empty else all_threads
@@ -535,7 +599,7 @@ with tab_clients:
                         next_action = th.get("next_action") or "—"
                         next_date = th.get("next_follow_up_date") or "pas de date"
                         st.caption(f"Prochaine action (avis de l'IA) : {next_action} ({next_date})")
-                        thread_msgs = sheets.load_email_messages_for_thread(th["thread_id"])
+                        thread_msgs = messages_for_thread_cached(th["thread_id"])
                         for _, m in thread_msgs.iterrows():
                             who = "Nous" if m["direction"] == "out" else "Eux"
                             st.text(f"[{m['date']}] {who} : {m.get('subject', '')}\n{str(m.get('body_text', ''))[:500]}")
@@ -601,7 +665,7 @@ with tab_prospecting:
 
     with st.expander("🗂 Historique des recherches (pour ne pas repasser deux fois au même endroit)"):
         try:
-            log_df = sheets.load_search_log_df()
+            log_df = load_search_log_df_cached()
         except Exception as e:
             log_df = pd.DataFrame()
             st.caption(f"Historique indisponible pour l'instant : {e}")
@@ -658,6 +722,7 @@ with tab_prospecting:
                     st.session_state["prospect_log_row"] = sheets.log_prospect_search(
                         prospect_city.strip(), prospect_sectors, prospect_nearby, len(results)
                     )
+                    load_search_log_df_cached.clear()
                 except Exception as e:
                     st.error(f"Erreur lors de la recherche : {e}")
 
@@ -836,7 +901,7 @@ with tab_letters:
         client = sheets.get_client_by_id(int(client_id), df=df)
 
         try:
-            images_df = sheets.load_images_df()
+            images_df = load_images_df_cached()
         except Exception:
             images_df = pd.DataFrame()
         image_options = ["(Aucune image)"] + (images_df["name"].tolist() if not images_df.empty else [])
@@ -1144,7 +1209,7 @@ with tab_gmail:
         )
     else:
         try:
-            gmail_auth = sheets.load_gmail_auth()
+            gmail_auth = load_gmail_auth_cached()
         except Exception as e:
             gmail_auth = {}
             st.error(f"Impossible de lire la connexion Gmail : {e}")
@@ -1186,13 +1251,14 @@ with tab_gmail:
             with c3:
                 if st.button("🔌 Déconnecter"):
                     sheets.disconnect_gmail()
+                    load_gmail_auth_cached.clear()
                     st.success("Gmail déconnecté.")
                     st.rerun()
 
         st.divider()
         st.markdown("**Conversations importées**")
         try:
-            threads_df = sheets.load_email_threads_df()
+            threads_df = load_email_threads_df_cached()
         except Exception as e:
             threads_df = pd.DataFrame()
             st.caption(f"Impossible de charger les conversations : {e}")
@@ -1225,7 +1291,7 @@ with tab_gmail:
                     format_func=lambda tid: shown_threads[shown_threads["thread_id"] == tid]["subject"].values[0] or tid,
                     key="gmail_thread_select",
                 )
-                thread_messages = sheets.load_email_messages_for_thread(selected_thread)
+                thread_messages = messages_for_thread_cached(selected_thread)
                 for _, m in thread_messages.iterrows():
                     who = "📤 Nous" if m["direction"] == "out" else "📥 Eux"
                     with st.expander(f"{m['date']} — {who} — {m.get('subject', '')}"):
