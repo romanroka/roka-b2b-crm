@@ -66,6 +66,65 @@ if brand_settings.get("activity_description") or brand_settings.get("product_des
 
 st.set_page_config(page_title=config.APP_TITLE, page_icon=config.APP_ICON, layout="wide")
 
+# ---------------------------------------------------------------------------
+# Design minimaliste — optionnel, activable dans l'onglet "⚙️ Paramètres".
+# Ne touche à aucune donnée ni logique : juste un peu de CSS pour un rendu
+# plus épuré (espacements, boutons, typographie). Désactivé par défaut pour
+# ne rien changer sans que ce soit demandé.
+# ---------------------------------------------------------------------------
+MINIMAL_DESIGN_ENABLED = str(brand_settings.get("minimal_design", "")).strip().lower() in (
+    "1", "true", "oui", "yes",
+)
+
+MINIMAL_DESIGN_CSS = """
+<style>
+html, body, [class*="css"] {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+#MainMenu { visibility: hidden; }
+footer { visibility: hidden; }
+.block-container {
+    padding-top: 2.5rem;
+    padding-bottom: 3rem;
+    max-width: 1100px;
+}
+h1, h2, h3 {
+    font-weight: 600 !important;
+    letter-spacing: -0.01em;
+}
+div.stButton > button, .stDownloadButton > button, .stLinkButton > a {
+    border-radius: 6px !important;
+    font-weight: 500 !important;
+    box-shadow: none !important;
+}
+div[data-testid="stForm"] {
+    border: 1px solid rgba(128, 128, 128, 0.2);
+    border-radius: 10px;
+    padding: 1.2rem 1.2rem 0.4rem 1.2rem;
+}
+[data-testid="stMetricValue"] {
+    font-weight: 600 !important;
+}
+.stTabs [data-baseweb="tab-list"] {
+    gap: 4px;
+}
+.stTabs [data-baseweb="tab"] {
+    padding: 8px 18px;
+}
+hr {
+    margin: 1.6rem 0;
+    opacity: 0.15;
+}
+[data-testid="stExpander"] {
+    border: 1px solid rgba(128, 128, 128, 0.15);
+    border-radius: 8px;
+}
+</style>
+"""
+
+if MINIMAL_DESIGN_ENABLED:
+    st.markdown(MINIMAL_DESIGN_CSS, unsafe_allow_html=True)
+
 
 # ---------------------------------------------------------------------------
 # Данные — с кэшем, чтобы не дёргать Google Sheets на каждый клик
@@ -188,6 +247,14 @@ with tab_settings:
                 value=int(brand_settings.get("sample_relance_delay_days") or config.SAMPLE_RELANCE_DELAY_DAYS),
             )
 
+        st.markdown("**Apparence**")
+        f_minimal_design = st.checkbox(
+            "🎨 Design minimaliste (optionnel)",
+            value=str(brand_settings.get("minimal_design", "")).strip().lower() in ("1", "true", "oui", "yes"),
+            help="Rendu plus épuré : espacements plus généreux, boutons plus discrets, "
+                 "menu Streamlit masqué. N'affecte aucune donnée, juste l'apparence.",
+        )
+
         submitted = st.form_submit_button("💾 Enregistrer")
         if submitted:
             sheets.save_brand_settings(
@@ -205,6 +272,7 @@ with tab_settings:
                     "sender_email": f_sender_email,
                     "relance_delay_days": f_relance_days,
                     "sample_relance_delay_days": f_sample_days,
+                    "minimal_design": "oui" if f_minimal_design else "non",
                 }
             )
             st.success("Enregistré ! L'appli se recharge avec ces informations…")
