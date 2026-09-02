@@ -291,15 +291,24 @@ def _parse_stage_json(text: str) -> dict:
     }
 
 
-def classify_thread(thread_id: str) -> dict:
+def classify_thread(thread_id: str, messages_df: pd.DataFrame = None) -> dict:
     """
     Envoie l'historique complet d'un thread à Claude et lui demande de
     déterminer le stage CRM, la prochaine action concrète, et une date de
     relance suggérée si besoin.
     Renvoie {"stage", "reasoning", "next_action", "next_follow_up_date"}
     (valeurs vides si le thread est introuvable ou si l'IA n'a pas pu répondre).
+
+    Si on classifie PLUSIEURS threads d'affilée (ex: pendant sync()), passer
+    messages_df déjà chargé une seule fois (sheets.load_all_email_messages_df())
+    pour éviter un appel API de lecture par thread — sinon on épuise vite le
+    quota Google Sheets. Sans messages_df, on charge juste ce thread (usage
+    ponctuel, ex: affichage dans l'appli).
     """
-    messages_df = sheets.load_email_messages_for_thread(thread_id)
+    if messages_df is None:
+        messages_df = sheets.load_email_messages_for_thread(thread_id)
+    else:
+        messages_df = messages_df[messages_df["thread_id"] == str(thread_id)].sort_values("date")
     if messages_df.empty:
         return {"stage": "", "reasoning": "", "next_action": "", "next_follow_up_date": ""}
 
@@ -443,8 +452,16 @@ def sync(max_messages: int = None) -> dict:
     if new_messages:
         sheets.append_email_messages(new_messages)
 
+    # --- Liaison aux clients existants -----------------------------------
+    # Un seul chargement de la feuille Clients pour TOUS les threads de ce
+    # cycle (au lieu d'un find_or_create_client_for_email() par thread, qui
+    # relirait toute la feuille à chaque fois et épuiserait vite le quota
+    # Google Sheets — c'est ce qui causait l'erreur 429 "Quota exceeded").
     existing_threads_df = sheets.load_email_threads_df()
+    clients_df = sheets.load_clients_df()
+
     thread_rows = []
+    pending_new_clients = {}  # email -> index dans thread_rows à corriger ensuite
     for thread_id, agg in threads_seen.items():
         if not existing_threads_df.empty:
             prior = existing_threads_df[existing_threads_df["thread_id"] == thread_id]
@@ -454,7 +471,7 @@ def sync(max_messages: int = None) -> dict:
 
         client_id = _clean_client_id(prior_row.get("client_id"))
         if client_id is None and agg["contact_email"]:
-            client_id = sheets.find_or_create_client_for_email(agg["contact_email"])
+            client_id = sheets.find_client_id_by_email(agg["contact_email"], clients_df)
 
         last_inbound = agg["last_inbound"] or prior_row.get("last_inbound_date", "")
         last_outbound = agg["last_outbound"] or prior_row.get("last_outbound_date", "")
@@ -474,29 +491,61 @@ def sync(max_messages: int = None) -> dict:
                 "last_synced_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
             }
         )
+        if client_id is None and agg["contact_email"]:
+            pending_new_clients.setdefault(agg["contact_email"], []).append(len(thread_rows) - 1)
+
+    # Crée en un seul appel batch tous les nouveaux clients nécessaires
+    # (un par email distinct rencontré, pas un par thread).
+    if pending_new_clients:
+        emails_to_create = list(pending_new_clients.keys())
+        new_client_dicts = []
+        for email in emails_to_create:
+            domain = email.split("@")[-1] if "@" in email else email
+            guessed_company = domain.split(".")[0].capitalize() if domain else email
+            new_client_dicts.append(
+                {
+                    "company": guessed_company,
+                    "contact_name": email,
+                    "email": email,
+                    "source": "Import Gmail",
+                    "notes": f"Créé automatiquement depuis Gmail (domaine : {domain}). À compléter/vérifier.",
+                }
+            )
+        new_ids = sheets.append_clients(new_client_dicts)
+        for email, new_id in zip(emails_to_create, new_ids):
+            for row_index in pending_new_clients[email]:
+                thread_rows[row_index]["client_id"] = new_id
 
     if thread_rows:
         sheets.upsert_email_threads(thread_rows)
 
+    # --- Classification IA -------------------------------------------------
+    # Un seul chargement de TOUS les messages (au lieu d'un
+    # load_email_messages_for_thread() par thread), et un seul appel
+    # d'écriture groupé pour tous les threads classifiés (au lieu d'un
+    # upsert_email_threads() par thread) — même logique anti-429 que ci-dessus.
+    all_messages_df = sheets.load_all_email_messages_df()
     classified = 0
+    classified_rows = []
     for row in thread_rows:
         try:
-            stage_info = classify_thread(row["thread_id"])
+            stage_info = classify_thread(row["thread_id"], messages_df=all_messages_df)
             if stage_info["stage"]:
-                sheets.upsert_email_threads(
-                    [
-                        {
-                            "thread_id": row["thread_id"],
-                            "ai_stage": stage_info["stage"],
-                            "ai_stage_reasoning": stage_info["reasoning"],
-                            "next_action": stage_info["next_action"],
-                            "next_follow_up_date": stage_info["next_follow_up_date"],
-                        }
-                    ]
+                classified_rows.append(
+                    {
+                        "thread_id": row["thread_id"],
+                        "ai_stage": stage_info["stage"],
+                        "ai_stage_reasoning": stage_info["reasoning"],
+                        "next_action": stage_info["next_action"],
+                        "next_follow_up_date": stage_info["next_follow_up_date"],
+                    }
                 )
                 classified += 1
         except Exception:
             continue
+
+    if classified_rows:
+        sheets.upsert_email_threads(classified_rows)
 
     sheets.save_gmail_auth(
         {

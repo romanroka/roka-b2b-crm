@@ -759,10 +759,41 @@ def load_email_messages_for_thread(thread_id: str) -> pd.DataFrame:
     return df[df["thread_id"] == str(thread_id)].sort_values("date")
 
 
+def load_all_email_messages_df() -> pd.DataFrame:
+    """Charge TOUTE la feuille EmailMessages en UN SEUL appel API — à utiliser
+    quand on doit traiter plusieurs threads d'affilée (ex: classification IA
+    de tous les threads pendant une synchro Gmail), pour éviter un
+    load_email_messages_for_thread() par thread (qui relirait toute la feuille
+    à chaque fois et épuiserait vite le quota Google Sheets)."""
+    ws = get_or_create_email_messages_worksheet()
+    records = ws.get_all_records()
+    return pd.DataFrame(records, columns=EMAIL_MESSAGES_COLUMNS)
+
+
 # ---------------------------------------------------------------------------
 # Gmail — lien avec les Clients existants
 # ---------------------------------------------------------------------------
-def find_or_create_client_for_email(email_address: str, display_name: str = "") -> Optional[int]:
+def find_client_id_by_email(email_address: str, df: Optional[pd.DataFrame] = None) -> Optional[int]:
+    """Recherche pure (aucune création) d'un client existant par email. Si df
+    est déjà chargé (recommandé quand on traite plusieurs emails d'affilée,
+    ex: pendant une synchro Gmail), on l'utilise au lieu de relire la feuille
+    à chaque appel."""
+    email_address = (email_address or "").strip().lower()
+    if not email_address:
+        return None
+    if df is None:
+        df = load_clients_df()
+    if df.empty:
+        return None
+    match = df[df["email"].astype(str).str.strip().str.lower() == email_address]
+    if match.empty:
+        return None
+    return int(match.iloc[0]["id"])
+
+
+def find_or_create_client_for_email(
+    email_address: str, display_name: str = "", clients_df: Optional[pd.DataFrame] = None
+) -> Optional[int]:
     """
     Cherche un client existant par email (colonne "email" de Clients). Si
     aucun ne correspond, en crée un nouveau automatiquement (import Gmail)
@@ -770,16 +801,19 @@ def find_or_create_client_for_email(email_address: str, display_name: str = "") 
     provisoire — à corriger/compléter à la main ensuite si besoin.
     Renvoie l'id du client (existant ou nouvellement créé), ou None si
     email_address est vide.
+
+    Pour traiter PLUSIEURS emails d'affilée (ex: synchro Gmail avec beaucoup
+    de threads), préférer charger clients_df une seule fois en amont et le
+    passer ici — sinon chaque appel relit toute la feuille Clients, ce qui
+    épuise vite le quota Google Sheets. Voir aussi find_client_id_by_email().
     """
     email_address = (email_address or "").strip().lower()
     if not email_address:
         return None
 
-    df = load_clients_df()
-    if not df.empty:
-        match = df[df["email"].astype(str).str.strip().str.lower() == email_address]
-        if not match.empty:
-            return int(match.iloc[0]["id"])
+    existing_id = find_client_id_by_email(email_address, clients_df)
+    if existing_id is not None:
+        return existing_id
 
     domain = email_address.split("@")[-1] if "@" in email_address else email_address
     guessed_company = domain.split(".")[0].capitalize() if domain else email_address
