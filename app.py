@@ -16,10 +16,8 @@ import streamlit as st
 from PIL import Image
 
 import config
-import gmail_sync
 import letters
 import prospecting
-import scoring
 import sheets
 
 # Taille max d'une image encodée en base64 stockée dans une cellule Google
@@ -38,11 +36,6 @@ IMAGE_MAX_BASE64_CHARS = 42000
 @st.cache_data(ttl=30, show_spinner=False)
 def load_brand_settings_cached() -> dict:
     return sheets.load_brand_settings()
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def load_gmail_auth_cached() -> dict:
-    return sheets.load_gmail_auth()
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -189,23 +182,6 @@ if MINIMAL_DESIGN_ENABLED:
 
 
 # ---------------------------------------------------------------------------
-# Gmail — retour de l'écran d'autorisation Google (présence de ?code=... dans
-# l'URL). On échange le code contre les tokens, on les sauvegarde, puis on
-# nettoie l'URL pour ne pas retraiter le même code à chaque rechargement.
-# ---------------------------------------------------------------------------
-if "code" in st.query_params and config.GMAIL_CLIENT_ID:
-    try:
-        _tokens = gmail_sync.exchange_code_for_tokens(st.query_params["code"])
-        sheets.save_gmail_auth(_tokens)
-        load_gmail_auth_cached.clear()
-        st.query_params.clear()
-        st.success("✅ Gmail connecté avec succès ! Va dans l'onglet 📧 Gmail pour lancer le premier import.")
-    except Exception as e:
-        st.query_params.clear()
-        st.error(f"Erreur lors de la connexion à Gmail : {e}")
-
-
-# ---------------------------------------------------------------------------
 # Данные — с кэшем, чтобы не дёргать Google Sheets на каждый клик
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=30, show_spinner="Chargement depuis Google Sheets…")
@@ -216,7 +192,6 @@ def load_data() -> pd.DataFrame:
 def refresh():
     load_data.clear()
     load_brand_settings_cached.clear()
-    load_gmail_auth_cached.clear()
     load_images_df_cached.clear()
     load_email_threads_df_cached.clear()
     load_search_log_df_cached.clear()
@@ -246,34 +221,8 @@ except Exception as e:
     )
     st.stop()
 
-# ---------------------------------------------------------------------------
-# Gmail — synchronisation "automatique" à l'ouverture de l'appli. Le tout
-# PREMIER import (potentiellement des centaines de messages + classification
-# IA de chaque conversation) se lance à la main depuis l'onglet Gmail, pour
-# ne pas bloquer l'appli plusieurs minutes à l'ouverture sans prévenir.
-# Une fois ce premier import fait, les ouvertures suivantes resynchronisent
-# tout seules (au plus une fois toutes les GMAIL_MIN_SYNC_INTERVAL_MINUTES
-# minutes) — c'est ça, "l'automatique" possible sur un hébergement gratuit
-# qui ne fait tourner aucun processus permanent en tâche de fond.
-# ---------------------------------------------------------------------------
-try:
-    _gmail_auth = load_gmail_auth_cached()
-except Exception:
-    _gmail_auth = {}
-
-if (
-    _gmail_auth.get("refresh_token")
-    and _gmail_auth.get("last_synced_at")
-    and gmail_sync.should_auto_sync(_gmail_auth)
-):
-    try:
-        gmail_sync.sync()
-        refresh()
-    except Exception:
-        pass  # on ne bloque jamais l'appli pour un souci de sync silencieux
-
-tab_settings, tab_clients, tab_prospecting, tab_scoring, tab_letters, tab_relance, tab_dashboard, tab_gmail = st.tabs(
-    ["⚙️ Paramètres", "📋 Clients", "🔎 Prospection", "🎯 Scoring", "✉️ Lettres", "🔁 Relances", "📊 Dashboard", "📧 Gmail"]
+tab_settings, tab_clients, tab_prospecting, tab_letters = st.tabs(
+    ["⚙️ Paramètres", "📋 Clients", "🔎 Prospection", "✉️ Lettres"]
 )
 
 # ---------------------------------------------------------------------------
@@ -284,7 +233,7 @@ with tab_settings:
     st.subheader("Informations sur l'entreprise / la marque")
     st.caption(
         "Ces infos servent à personnaliser TOUT ce que l'IA génère (les emails "
-        "de prospection et de relance) — plus c'est précis, moins les messages "
+        "de prospection) — plus c'est précis, moins les messages "
         "sont génériques. Elles servent aussi pour le titre de l'appli et la "
         "signature des emails."
     )
@@ -396,7 +345,7 @@ with tab_settings:
     st.caption(
         "Ajoute ici une fois pour toutes les images que tu veux pouvoir insérer "
         "dans tes emails (photo produit, logo...) — ensuite, dans l'onglet "
-        "✉️ Lettres, tu choisis simplement laquelle utiliser dans une liste. "
+        "✉️ Lettres, télécharge celle à joindre dans ton client mail. "
         "Les images sont automatiquement redimensionnées/compressées pour "
         "rester légères (elles sont stockées dans la Google Sheet)."
     )
@@ -540,7 +489,7 @@ with tab_clients:
             shown[
                 [
                     "id", "company", "contact_name", "sector", "city", "status",
-                    "fit_score", "fit_label", "last_contact_date", "next_relance_date",
+                    "last_contact_date", "next_relance_date",
                 ]
             ],
             use_container_width=True,
@@ -579,7 +528,7 @@ with tab_clients:
                     else "relancer suite à un email sans réponse"
                 )
                 if str(next_date) <= today_str():
-                    st.warning(f"⏰ **À faire maintenant** ({next_date}) : {motif}. Voir l'onglet Relances.")
+                    st.warning(f"⏰ **À faire maintenant** ({next_date}) : {motif}.")
                 else:
                     st.info(f"⏰ **Prochaine action prévue le {next_date}** : {motif}.")
             else:
@@ -595,7 +544,7 @@ with tab_clients:
                 client_threads = pd.DataFrame()
 
             if not client_threads.empty:
-                st.markdown("**📧 Correspondance Gmail liée**")
+                st.markdown("**📧 Historique de correspondance importé**")
                 for _, th in client_threads.iterrows():
                     stage = th.get("ai_stage") or "stage non déterminé"
                     with st.expander(f"{th.get('subject', '')} — {stage}"):
@@ -834,94 +783,21 @@ with tab_prospecting:
                 st.rerun()
 
 # ---------------------------------------------------------------------------
-# TAB: Scoring
-# ---------------------------------------------------------------------------
-with tab_scoring:
-    st.subheader("Évaluer si un prospect correspond à ROKA (fit / pas fit)")
-    st.caption(
-        "Score basé sur des règles simples et transparentes (secteur, zone, volume, "
-        "sensibilité au prix) — modifiables dans config.py. Pas d'IA ici, exprès : "
-        "un score doit être reproductible et explicable."
-    )
-
-    if df.empty:
-        st.info("Ajoute des clients dans l'onglet Clients d'abord.")
-    else:
-        to_score = df[df["status"].isin(["Nouveau", "À qualifier"])]
-        st.write(f"**{len(to_score)}** client(s) en attente de scoring.")
-
-        if not to_score.empty and st.button("⚡ Scorer tous les clients en attente"):
-            results = []
-            updates_by_id = {}
-            for _, row in to_score.iterrows():
-                res = scoring.score_client(row.to_dict())
-                new_status = (
-                    "À contacter" if res.label == "Fit ✅"
-                    else "Non pertinent" if res.label == "Pas fit ❌"
-                    else "À qualifier"
-                )
-                updates_by_id[int(row["id"])] = {
-                    "fit_score": res.score,
-                    "fit_label": res.label,
-                    "fit_reasoning": res.reasoning,
-                    "status": new_status,
-                }
-                results.append({"id": row["id"], "company": row["company"], "score": res.score, "label": res.label})
-            # un seul appel à l'API pour tout le lot — évite d'épuiser le quota
-            # Google Sheets quand il y a beaucoup de clients à scorer d'un coup
-            sheets.update_clients(updates_by_id)
-            st.success(f"{len(results)} client(s) scoré(s).")
-            st.dataframe(pd.DataFrame(results), hide_index=True, use_container_width=True)
-            refresh()
-
-        st.divider()
-        st.markdown("**Scorer un client précis**")
-        client_id = st.selectbox("Client", df["id"].tolist(), key="score_select")
-        if client_id:
-            client = sheets.get_client_by_id(int(client_id), df=df)
-            st.write(f"Secteur : {client['sector']} · Zone : {client['region']} · "
-                      f"Volume : {client['volume_potential']} · Sensibilité prix : {client['price_sensitivity']}")
-            if st.button("Calculer le score"):
-                res = scoring.score_client(client)
-                st.metric("Score", f"{res.score}/100", res.label)
-                st.text(res.reasoning)
-                st.session_state["last_score"] = res
-
-            if "last_score" in st.session_state and st.button("💾 Enregistrer ce score"):
-                res = st.session_state["last_score"]
-                new_status = (
-                    "À contacter" if res.label == "Fit ✅"
-                    else "Non pertinent" if res.label == "Pas fit ❌"
-                    else "À qualifier"
-                )
-                sheets.update_client(
-                    int(client_id),
-                    {
-                        "fit_score": res.score,
-                        "fit_label": res.label,
-                        "fit_reasoning": res.reasoning,
-                        "status": new_status,
-                    },
-                )
-                st.success("Score enregistré.")
-                del st.session_state["last_score"]
-                refresh()
-                st.rerun()
-
-# ---------------------------------------------------------------------------
 # TAB: Lettres
 # ---------------------------------------------------------------------------
 with tab_letters:
     st.subheader("Générer une lettre de prise de contact personnalisée")
     st.caption(
         "Objet ET corps du message générés par Claude à partir du profil du "
-        "client — relis toujours avant d'envoyer. Rien ne part sans que tu "
-        "cliques explicitement sur un bouton d'envoi."
+        "client — relis toujours avant d'envoyer depuis ton client mail."
     )
 
-    eligible = df[df["status"] == "À contacter"] if not df.empty else df
+    eligible = df[df["status"].isin(["Nouveau", "À qualifier", "À contacter"])] if not df.empty else df
     if eligible.empty:
-        st.info("Aucun client au statut « À contacter ». Score des clients dans l'onglet Scoring d'abord.")
+        st.info(
+            "Ajoute un prospect dans Clients ou Prospection, ou passe un client "
+            "au statut « À contacter » dans Clients pour préparer son premier email."
+        )
     else:
         client_id = st.selectbox(
             "Client", eligible["id"].tolist(),
@@ -935,10 +811,21 @@ with tab_letters:
             images_df = pd.DataFrame()
         image_options = ["(Aucune image)"] + (images_df["name"].tolist() if not images_df.empty else [])
         selected_image_name = st.selectbox(
-            "🖼️ Image à insérer dans l'email (optionnel)",
+            "🖼️ Image à joindre à l'email (optionnel)",
             image_options,
             help="Gère la bibliothèque d'images dans l'onglet ⚙️ Paramètres.",
         )
+
+        if selected_image_name != "(Aucune image)":
+            selected_image = images_df[images_df["name"] == selected_image_name].iloc[0]
+            image_mime = selected_image["content_type"]
+            st.download_button(
+                "📥 Télécharger l'image à joindre",
+                data=base64.b64decode(selected_image["data_base64"]),
+                file_name="image.png" if image_mime == "image/png" else "image.jpg",
+                mime=image_mime,
+            )
+            st.caption("Ajoute cette image manuellement à ton email dans ton client mail.")
 
         if st.button("✍️ Générer la lettre (objet + texte)"):
             with st.spinner("Génération en cours…"):
@@ -956,14 +843,7 @@ with tab_letters:
             )
             edited = st.text_area("Texte de la lettre (modifiable)", value=st.session_state["draft_letter"], height=300)
 
-            has_image = selected_image_name != "(Aucune image)"
-            if has_image:
-                st.caption(
-                    "ℹ️ L'image ne s'affichera QUE si tu utilises « Envoyer via Gmail » ci-dessous "
-                    "— un lien « ouvrir dans mon client mail » ne peut techniquement pas inclure d'image."
-                )
-
-            st.markdown("**Option 1 — tu envoies toi-même**")
+            st.markdown("**Envoyer depuis ton client mail**")
             c1, c2 = st.columns(2)
             with c1:
                 mailto_body = quote(edited)
@@ -996,332 +876,3 @@ with tab_letters:
                 st.session_state.pop("draft_subject", None)
                 refresh()
                 st.rerun()
-
-            st.markdown("**Option 2 — l'appli envoie pour toi, pour de vrai, via Gmail**")
-            send_label = "📧 Envoyer via Gmail" + (" (avec image)" if has_image else "")
-            if st.button(send_label, type="primary"):
-                image_payload = sheets.get_image(selected_image_name) if has_image else None
-                with st.spinner("Envoi en cours…"):
-                    try:
-                        gmail_sync.send_single(
-                            client.get("email", ""), edited_subject, edited, image=image_payload
-                        )
-                        sheets.update_client(
-                            int(client_id),
-                            {
-                                "letter_text": edited,
-                                "letter_generated_at": today_str(),
-                                "status": "Contacté",
-                                "last_contact_date": today_str(),
-                                "next_relance_date": add_days(today_str(), config.RELANCE_DELAY_DAYS),
-                            },
-                        )
-                        sheets.log_message(
-                            int(client_id), client.get("company", ""), "Premier email (envoyé via Gmail)", edited
-                        )
-                        st.success(
-                            f"✅ Email envoyé pour de vrai via Gmail. Relance programmée dans "
-                            f"{config.RELANCE_DELAY_DAYS} jours."
-                        )
-                        del st.session_state["draft_letter"]
-                        st.session_state.pop("draft_subject", None)
-                        refresh()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erreur lors de l'envoi : {e}")
-
-# ---------------------------------------------------------------------------
-# TAB: Relances
-# ---------------------------------------------------------------------------
-with tab_relance:
-    st.subheader(
-        f"Relances (par défaut {config.RELANCE_DELAY_DAYS} jours après un email, "
-        f"{config.SAMPLE_RELANCE_DELAY_DAYS} jours après l'envoi d'échantillons)"
-    )
-
-    if df.empty:
-        st.info("Pas encore de client.")
-    else:
-        open_df = df[df["status"].isin(config.OPEN_STATUSES_FOR_RELANCE)].copy()
-        due_today = open_df[
-            open_df["next_relance_date"].fillna("") <= today_str()
-        ]
-        due_today = due_today[due_today["next_relance_date"].fillna("") != ""]
-
-        st.write(f"**{len(due_today)}** client(s) à relancer aujourd'hui (ou en retard).")
-        if not due_today.empty:
-            due_today_display = due_today.copy()
-            due_today_display["Motif"] = due_today_display["status"].map(
-                lambda s: "📦 Échantillons envoyés" if s == "RDV / Échantillons" else "✉️ Email sans réponse"
-            )
-            st.dataframe(
-                due_today_display[
-                    ["id", "company", "Motif", "last_contact_date", "next_relance_date", "relance_count"]
-                ],
-                hide_index=True, use_container_width=True,
-            )
-
-        st.divider()
-        pool = due_today if not due_today.empty else open_df
-        if pool.empty:
-            st.info("Rien à relancer pour l'instant.")
-        else:
-            client_id = st.selectbox(
-                "Client à relancer", pool["id"].tolist(),
-                format_func=lambda i: f"{i} — {pool[pool['id'] == i]['company'].values[0]}",
-            )
-            client = sheets.get_client_by_id(int(client_id), df=df)
-
-            st.markdown("**Tu viens d'envoyer des échantillons à ce client ?**")
-            if st.button("📦 Marquer échantillons envoyés"):
-                sheets.update_client(
-                    int(client_id),
-                    {
-                        "status": "RDV / Échantillons",
-                        "last_contact_date": today_str(),
-                        "next_relance_date": add_days(today_str(), config.SAMPLE_RELANCE_DELAY_DAYS),
-                    },
-                )
-                sheets.log_message(
-                    int(client_id), client.get("company", ""), "Échantillons envoyés",
-                    "(envoi physique — pas de texte d'email)",
-                )
-                st.success(
-                    f"Noté. Relance programmée dans {config.SAMPLE_RELANCE_DELAY_DAYS} jours "
-                    "pour avoir son avis sur les échantillons."
-                )
-                refresh()
-                st.rerun()
-
-            st.divider()
-            if st.button("✍️ Générer la relance (objet + texte)"):
-                with st.spinner("Génération en cours…"):
-                    try:
-                        result = letters.generate_relance(client)
-                        st.session_state["draft_relance_subject"] = result["subject"]
-                        st.session_state["draft_relance"] = result["body"]
-                    except Exception as e:
-                        st.error(f"Erreur lors de la génération : {e}")
-
-            if "draft_relance" in st.session_state:
-                edited_relance_subject = st.text_input(
-                    "Objet de la relance (modifiable, généré automatiquement)",
-                    value=st.session_state.get("draft_relance_subject", ""),
-                    key="relance_subject_input",
-                )
-                edited = st.text_area("Texte de la relance (modifiable)", value=st.session_state["draft_relance"], height=200)
-                mailto_body = quote(edited)
-                mailto_subject = quote(edited_relance_subject)
-                mail_link = f"mailto:{client.get('email', '')}?subject={mailto_subject}&body={mailto_body}"
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.link_button("📧 Ouvrir dans mon client mail", mail_link)
-                with c2:
-                    if st.button("✅ Marquer la relance comme envoyée"):
-                        sheets.update_client(
-                            int(client_id),
-                            {
-                                "status": "Relance envoyée",
-                                "last_contact_date": today_str(),
-                                "next_relance_date": add_days(today_str(), config.RELANCE_DELAY_DAYS),
-                                "relance_count": int(client.get("relance_count") or 0) + 1,
-                            },
-                        )
-                        sheets.log_message(int(client_id), client.get("company", ""), "Relance", edited)
-                        st.success("Relance enregistrée.")
-                        del st.session_state["draft_relance"]
-                        st.session_state.pop("draft_relance_subject", None)
-                        refresh()
-                        st.rerun()
-
-                if st.button("📧 Envoyer cette relance via Gmail (pour de vrai)"):
-                    with st.spinner("Envoi en cours…"):
-                        try:
-                            gmail_sync.send_single(client.get("email", ""), edited_relance_subject, edited)
-                            sheets.update_client(
-                                int(client_id),
-                                {
-                                    "status": "Relance envoyée",
-                                    "last_contact_date": today_str(),
-                                    "next_relance_date": add_days(today_str(), config.RELANCE_DELAY_DAYS),
-                                    "relance_count": int(client.get("relance_count") or 0) + 1,
-                                },
-                            )
-                            sheets.log_message(
-                                int(client_id), client.get("company", ""), "Relance (envoyée via Gmail)", edited
-                            )
-                            st.success("✅ Relance envoyée pour de vrai via Gmail.")
-                            del st.session_state["draft_relance"]
-                            st.session_state.pop("draft_relance_subject", None)
-                            refresh()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Erreur lors de l'envoi : {e}")
-
-            st.divider()
-            st.markdown("**Ou mettre à jour le statut directement** (le client a répondu, a dit non, etc.)")
-            new_status = st.selectbox("Nouveau statut", config.STATUSES, key="relance_status_update")
-            if st.button("Mettre à jour le statut"):
-                sheets.update_client(int(client_id), {"status": new_status})
-                st.success("Statut mis à jour.")
-                refresh()
-                st.rerun()
-
-# ---------------------------------------------------------------------------
-# TAB: Dashboard
-# ---------------------------------------------------------------------------
-with tab_dashboard:
-    st.subheader("Métriques")
-
-    if df.empty:
-        st.info("Pas encore de données.")
-    else:
-        total = len(df)
-        scored = df[df["fit_score"].notna()]
-        fit_count = len(df[df["fit_label"] == "Fit ✅"])
-        contacted = df[df["status"].isin(
-            ["Contacté", "Relance envoyée", "Répondu", "RDV / Échantillons", "Client", "Pas intéressé"]
-        )]
-        replied = df[df["status"].isin(["Répondu", "RDV / Échantillons", "Client"])]
-        clients_won = len(df[df["status"] == "Client"])
-
-        due_today = df[
-            df["status"].isin(config.OPEN_STATUSES_FOR_RELANCE)
-            & (df["next_relance_date"].fillna("") <= today_str())
-            & (df["next_relance_date"].fillna("") != "")
-        ]
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Clients au total", total)
-        c2.metric("Fit ✅", fit_count, f"{(fit_count/total*100):.0f}% de la base" if total else None)
-        c3.metric("Contactés", len(contacted))
-        response_rate = (len(replied) / len(contacted) * 100) if len(contacted) else 0
-        c4.metric("Taux de réponse", f"{response_rate:.0f}%")
-        c5.metric("À relancer aujourd'hui", len(due_today))
-
-        st.divider()
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Répartition par statut**")
-            status_counts = df["status"].value_counts().reindex(config.STATUSES).fillna(0)
-            st.bar_chart(status_counts)
-        with col2:
-            st.markdown("**Répartition par secteur**")
-            sector_counts = df["sector"].value_counts()
-            st.bar_chart(sector_counts)
-
-        st.divider()
-        st.metric("Clients gagnés 🏆", clients_won)
-        if not scored.empty:
-            st.metric("Score moyen (clients scorés)", f"{scored['fit_score'].mean():.0f}/100")
-
-# ---------------------------------------------------------------------------
-# TAB: Gmail (import automatique des emails + CRM stage déterminé par l'IA)
-# ---------------------------------------------------------------------------
-with tab_gmail:
-    st.subheader("Import automatique depuis Gmail")
-    st.caption(
-        "Connecte ta boîte Gmail pour importer l'historique des emails envoyés "
-        "et reçus (12 derniers mois au premier import), créer/lier "
-        "automatiquement les clients correspondants, et laisser l'IA "
-        "déterminer où en est chaque conversation."
-    )
-
-    if not (config.GMAIL_CLIENT_ID and config.GMAIL_CLIENT_SECRET and config.GMAIL_REDIRECT_URI):
-        st.warning(
-            "Gmail n'est pas encore configuré. Il faut d'abord créer un "
-            "identifiant OAuth (\"Application Web\") dans Google Cloud Console "
-            "et renseigner GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / "
-            "GMAIL_REDIRECT_URI dans les Secrets de l'appli — voir "
-            "GMAIL_SETUP.md pour le guide pas à pas."
-        )
-    else:
-        try:
-            gmail_auth = load_gmail_auth_cached()
-        except Exception as e:
-            gmail_auth = {}
-            st.error(f"Impossible de lire la connexion Gmail : {e}")
-
-        connected = bool(gmail_auth.get("refresh_token"))
-
-        if not connected:
-            auth_url = gmail_sync.get_authorization_url(state="roka_crm")
-            st.link_button("🔐 Se connecter avec Google", auth_url)
-            st.caption(
-                "Tu seras redirigé vers Google pour autoriser la LECTURE SEULE "
-                "de ta boîte Gmail — aucun envoi, aucune suppression, aucune "
-                "modification n'est possible avec cet accès."
-            )
-        else:
-            last_sync = gmail_auth.get("last_synced_at", "")
-            c1, c2, c3 = st.columns([2, 1, 1])
-            with c1:
-                st.success(f"✅ Connecté : {gmail_auth.get('email_address', '')}")
-                st.caption(f"Dernière synchro : {last_sync or 'jamais — fais le premier import ci-contre'}")
-            with c2:
-                sync_label = "📥 Premier import (12 mois)" if not last_sync else "🔄 Synchroniser maintenant"
-                if st.button(sync_label):
-                    with st.spinner(
-                        "Synchronisation en cours… le premier import peut prendre "
-                        "plusieurs minutes selon le volume d'emails."
-                    ):
-                        try:
-                            result = gmail_sync.sync()
-                            st.success(
-                                f"{result['new_messages']} nouveau(x) message(s) · "
-                                f"{result['threads_updated']} conversation(s) mise(s) à jour · "
-                                f"{result['threads_classified']} classifiée(s) par l'IA."
-                            )
-                            refresh()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Erreur pendant la synchronisation : {e}")
-            with c3:
-                if st.button("🔌 Déconnecter"):
-                    sheets.disconnect_gmail()
-                    load_gmail_auth_cached.clear()
-                    st.success("Gmail déconnecté.")
-                    st.rerun()
-
-        st.divider()
-        st.markdown("**Conversations importées**")
-        try:
-            threads_df = load_email_threads_df_cached()
-        except Exception as e:
-            threads_df = pd.DataFrame()
-            st.caption(f"Impossible de charger les conversations : {e}")
-
-        if threads_df.empty:
-            st.info("Aucune conversation importée pour l'instant.")
-        else:
-            stage_filter = st.multiselect("Filtrer par stage", config.GMAIL_CRM_STAGES, key="gmail_stage_filter")
-            shown_threads = threads_df.copy()
-            if stage_filter:
-                shown_threads = shown_threads[shown_threads["ai_stage"].isin(stage_filter)]
-
-            shown_threads = shown_threads.sort_values("last_inbound_date", ascending=False)
-            st.dataframe(
-                shown_threads[
-                    [
-                        "contact_email", "subject", "ai_stage", "next_action",
-                        "next_follow_up_date", "last_inbound_date", "last_outbound_date", "message_count",
-                    ]
-                ],
-                hide_index=True, use_container_width=True,
-            )
-
-            st.markdown("**Voir un thread en détail**")
-            thread_options = shown_threads["thread_id"].tolist()
-            if thread_options:
-                selected_thread = st.selectbox(
-                    "Conversation",
-                    thread_options,
-                    format_func=lambda tid: shown_threads[shown_threads["thread_id"] == tid]["subject"].values[0] or tid,
-                    key="gmail_thread_select",
-                )
-                thread_messages = messages_for_thread_cached(selected_thread)
-                for _, m in thread_messages.iterrows():
-                    who = "📤 Nous" if m["direction"] == "out" else "📥 Eux"
-                    with st.expander(f"{m['date']} — {who} — {m.get('subject', '')}"):
-                        st.text(m.get("body_text", "") or "(pas de texte)")
