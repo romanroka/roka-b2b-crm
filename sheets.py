@@ -45,6 +45,7 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 
 import config
+import senders
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -76,6 +77,9 @@ SEARCH_LOG_COLUMNS = ["date", "city", "sectors", "elargi_environs", "trouves", "
 # Secrets — pratique pour configurer l'appli pour un nouveau client.
 CONFIG_WORKSHEET = "Config"
 CONFIG_HEADER = ["cle", "valeur"]
+
+SENDERS_WORKSHEET = "Utilisateurs"
+SENDERS_COLUMNS = ["id", "name", "role", "email", "context"]
 
 # Historique complet des messages envoyés à chaque client (un quatrième
 # onglet) — contrairement à client["letter_text"] qui ne garde que le
@@ -352,6 +356,39 @@ def save_brand_settings(settings: dict) -> None:
     # on force une relecture propre au prochain appel (clear() invaliderait
     # sinon un ws caché avec l'ancienne géométrie/contenu)
     _config_ws_cache["ts"] = 0.0
+
+
+def load_sender_profiles() -> list:
+    """Read profiles without creating a sheet or changing existing settings."""
+    try:
+        ws = _get_spreadsheet().worksheet(SENDERS_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        return []
+    return [
+        {key: str(record.get(key) or "") for key in SENDERS_COLUMNS}
+        for record in ws.get_all_records()
+        if record.get("id") and record.get("name")
+    ]
+
+
+def save_sender_profile(profile: dict) -> None:
+    """Update only the selected user; keep other users and brand settings intact."""
+    profile = senders.validate_sender(profile)
+    spreadsheet = _get_spreadsheet()
+    try:
+        ws = spreadsheet.worksheet(SENDERS_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=SENDERS_WORKSHEET, rows=100, cols=len(SENDERS_COLUMNS))
+        ws.append_row(SENDERS_COLUMNS, value_input_option="RAW")
+    if not ws.row_values(1):
+        ws.append_row(SENDERS_COLUMNS, value_input_option="RAW")
+    row = [profile[key] for key in SENDERS_COLUMNS]
+    ids = ws.col_values(1)
+    for row_number, identifier in enumerate(ids[1:], start=2):
+        if str(identifier) == profile["id"]:
+            ws.update(range_name=f"A{row_number}:E{row_number}", values=[row], value_input_option="RAW")
+            return
+    ws.append_row(row, value_input_option="RAW")
 
 
 def get_or_create_messages_worksheet(force_refresh: bool = False) -> gspread.Worksheet:

@@ -11,8 +11,32 @@
 """
 
 import anthropic
+from typing import Optional
 
 import config
+import senders
+
+
+def _sender_context(sender: dict) -> str:
+    return f"""Identité de la personne qui écrit cet email :
+Nom : {sender.get('name', '')}
+Fonction : {sender.get('role') or '(non renseignée — ne pas en inventer)'}
+Email : {sender.get('email') or '(non renseigné — ne pas en inventer)'}
+Contexte personnel : {sender.get('context') or '(aucun contexte personnel supplémentaire)'}
+
+Écris à la première personne au nom de cette personne uniquement.
+Son identité et sa fonction priment sur tout nom ou rôle d'expéditeur présent
+dans les informations de marque, les notes du prospect ou un ancien message.
+Ne lui attribue pas l'expérience, le titre ou les actions d'une autre personne.
+N'ajoute pas de signature : l'application ajoutera celle de cet utilisateur."""
+
+
+def _with_signature(result: dict, sender: dict) -> dict:
+    body = result["body"].rstrip()
+    signature = senders.signature(sender)
+    if signature and not body.endswith(signature):
+        body += "\n\n" + signature
+    return {**result, "body": body}
 
 
 def _get_anthropic_client() -> anthropic.Anthropic:
@@ -85,9 +109,11 @@ def _parse_subject_and_body(text: str, fallback_subject: str) -> dict:
     return {"subject": fallback_subject, "body": text.strip()}
 
 
-def generate_first_letter(client: dict) -> dict:
+def generate_first_letter(client: dict, sender: Optional[dict] = None, brand_context: Optional[str] = None) -> dict:
     """Renvoie {"subject": ..., "body": ...} — les deux personnalisés pour ce
     client précis par Claude en un seul appel."""
+    sender = senders.legacy_sender({}) if sender is None else sender
+    brand_context = config.BRAND_CONTEXT if brand_context is None else brand_context
     search_instructions = ""
     if config.ENABLE_WEB_SEARCH:
         search_instructions = """
@@ -104,8 +130,10 @@ la ville, sans faire semblant d'avoir des informations que tu n'as pas."""
 
     system_prompt = f"""Tu écris des emails de prospection B2B pour ROKA.
 
-{config.BRAND_CONTEXT}
+{brand_context}
 {search_instructions}
+
+{_sender_context(sender)}
 
 Règles impératives :
 - Écris en français, dans un français naturel et correct.
@@ -118,7 +146,7 @@ Règles impératives :
 - Longueur du corps : 100 à 150 mots maximum.
 - Termine par une proposition simple et sans pression (ex: envoyer quelques
   échantillons, ou proposer un court échange de 10 minutes).
-- Signe avec le nom, le rôle et l'email fournis, sans les inventer.
+- N'ajoute pas de signature : elle sera ajoutée par l'application.
 - L'objet de l'email doit être court (moins de 60 caractères), personnalisé
   (mentionne l'entreprise ou son secteur/ville — jamais générique), et donner
   envie d'ouvrir sans être putaclic ni écrit en majuscules.
@@ -131,9 +159,7 @@ SUJET: <objet ici>
 
 {_client_context(client)}
 
-Signature à utiliser :
-{config.SENDER_NAME}, {config.SENDER_ROLE}
-{config.SENDER_EMAIL}
+{_sender_context(sender)}
 
 Écris le premier email de prise de contact."""
 
@@ -147,11 +173,13 @@ Signature à utiliser :
     )
     text = _extract_text(message)
     fallback_subject = f"ROKA — café spécialité pour {client.get('company', '')}".strip()
-    return _parse_subject_and_body(text, fallback_subject)
+    return _with_signature(_parse_subject_and_body(text, fallback_subject), sender)
 
 
-def generate_relance(client: dict) -> dict:
+def generate_relance(client: dict, sender: Optional[dict] = None, brand_context: Optional[str] = None) -> dict:
     """Renvoie {"subject": ..., "body": ...}."""
+    sender = senders.legacy_sender({}) if sender is None else sender
+    brand_context = config.BRAND_CONTEXT if brand_context is None else brand_context
     is_after_samples = (client.get("status") or "").strip() == "RDV / Échantillons"
 
     if is_after_samples:
@@ -169,8 +197,10 @@ et est resté sans réponse. Reviens vers le prospect sans le culpabiliser."""
 
     system_prompt = f"""Tu écris des emails de relance B2B pour ROKA.
 
-{config.BRAND_CONTEXT}
+{brand_context}
 {context_instructions}
+
+{_sender_context(sender)}
 
 Règles impératives :
 - Écris en français, ton amical, léger, jamais culpabilisant ("je me permets
@@ -179,7 +209,7 @@ Règles impératives :
 - Rappelle en une phrase le sujet du message précédent, sans le recopier en entier.
 - Propose une porte de sortie simple ("dites-moi si ce n'est pas le bon
   moment, ou si vous préférez que je revienne plus tard").
-- Signe avec le nom, le rôle et l'email fournis.
+- N'ajoute pas de signature : elle sera ajoutée par l'application.
 - L'objet doit être court (moins de 60 caractères) et personnalisé (mentionne
   l'entreprise), différent de l'objet du premier message si possible.
 - Réponds STRICTEMENT dans ce format, rien avant ni après :
@@ -198,9 +228,7 @@ Voici le dernier message déjà envoyé, pour référence (ne pas le recopier) :
 {previous_letter}
 ---
 
-Signature à utiliser :
-{config.SENDER_NAME}, {config.SENDER_ROLE}
-{config.SENDER_EMAIL}
+{_sender_context(sender)}
 
 Écris un email de relance."""
 
@@ -214,4 +242,4 @@ Signature à utiliser :
     )
     text = _extract_text(message)
     fallback_subject = f"ROKA — un petit mot de plus, {client.get('company', '')}".strip()
-    return _parse_subject_and_body(text, fallback_subject)
+    return _with_signature(_parse_subject_and_body(text, fallback_subject), sender)

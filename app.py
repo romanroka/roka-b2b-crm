@@ -10,6 +10,7 @@ import base64
 import io
 from datetime import datetime, timedelta
 from urllib.parse import quote
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -18,6 +19,7 @@ from PIL import Image
 import config
 import letters
 import prospecting
+import senders
 import sheets
 
 # Taille max d'une image encodée en base64 stockée dans une cellule Google
@@ -36,6 +38,11 @@ IMAGE_MAX_BASE64_CHARS = 42000
 @st.cache_data(ttl=30, show_spinner=False)
 def load_brand_settings_cached() -> dict:
     return sheets.load_brand_settings()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_sender_profiles_cached() -> list:
+    return sheets.load_sender_profiles()
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -96,9 +103,6 @@ def _apply_setting(attr: str, key: str, cast=str) -> None:
 
 _apply_setting("APP_TITLE", "app_title")
 _apply_setting("APP_ICON", "app_icon")
-_apply_setting("SENDER_NAME", "sender_name")
-_apply_setting("SENDER_ROLE", "sender_role")
-_apply_setting("SENDER_EMAIL", "sender_email")
 _apply_setting("RELANCE_DELAY_DAYS", "relance_delay_days", int)
 _apply_setting("SAMPLE_RELANCE_DELAY_DAYS", "sample_relance_delay_days", int)
 
@@ -118,6 +122,9 @@ if brand_settings.get("activity_description") or brand_settings.get("product_des
     if brand_settings.get("tone_preferences"):
         _ctx_parts.append(f"Ton souhaité pour les emails : {brand_settings['tone_preferences']}")
     config.BRAND_CONTEXT = "\n".join(_ctx_parts)
+
+# Keep the generation context local to this script run, like the selected sender.
+brand_context = config.BRAND_CONTEXT
 
 st.set_page_config(page_title=config.APP_TITLE, page_icon=config.APP_ICON, layout="wide")
 
@@ -192,6 +199,7 @@ def load_data() -> pd.DataFrame:
 def refresh():
     load_data.clear()
     load_brand_settings_cached.clear()
+    load_sender_profiles_cached.clear()
     load_images_df_cached.clear()
     load_email_threads_df_cached.clear()
     load_search_log_df_cached.clear()
@@ -205,6 +213,10 @@ def today_str() -> str:
 
 def add_days(date_str: str, days: int) -> str:
     return (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def remember_draft_edit(draft_id: str, field: str, widget_key: str) -> None:
+    st.session_state["letter_drafts"][draft_id][field] = st.session_state[widget_key]
 
 
 st.title(f"{config.APP_ICON} {config.APP_TITLE}")
@@ -221,6 +233,33 @@ except Exception as e:
     )
     st.stop()
 
+try:
+    sender_profiles = load_sender_profiles_cached()
+except Exception as e:
+    st.error(f"Impossible de charger les utilisateurs : {e}. Réessaie en actualisant la page.")
+    st.stop()
+
+if not any(profile["id"] == "default" for profile in sender_profiles):
+    sender_profiles = [senders.legacy_sender(brand_settings), *sender_profiles]
+sender_by_id = {profile["id"]: profile for profile in sender_profiles}
+pending_sender_id = st.session_state.pop("pending_sender_id", None)
+if pending_sender_id in sender_by_id:
+    st.session_state["active_sender_id"] = pending_sender_id
+    st.session_state["edit_sender_id"] = pending_sender_id
+if st.session_state.get("active_sender_id") not in sender_by_id:
+    st.session_state["active_sender_id"] = sender_profiles[0]["id"]
+
+active_sender_id = st.selectbox(
+    "👤 Utilisateur actif",
+    list(sender_by_id),
+    format_func=lambda identifier: " — ".join(
+        value for value in (sender_by_id[identifier]["name"], sender_by_id[identifier]["email"]) if value
+    ),
+    key="active_sender_id",
+    help="Les lettres utilisent le nom, la fonction et le contexte de cet utilisateur. Gère les profils dans Paramètres.",
+)
+active_sender = sender_by_id[active_sender_id]
+
 tab_settings, tab_clients, tab_prospecting, tab_letters = st.tabs(
     ["⚙️ Paramètres", "📋 Clients", "🔎 Prospection", "✉️ Lettres"]
 )
@@ -230,12 +269,59 @@ tab_settings, tab_clients, tab_prospecting, tab_letters = st.tabs(
 # les emails générés par l'IA, sans jamais toucher au code)
 # ---------------------------------------------------------------------------
 with tab_settings:
+    st.subheader("👤 Utilisateurs et signatures")
+    st.caption("Ajoute les personnes qui écrivent aux clients, puis sélectionne l'utilisateur actif en haut de la page.")
+    if st.session_state.get("edit_sender_id") not in [*sender_by_id, "__new__"]:
+        st.session_state["edit_sender_id"] = active_sender_id
+    edit_sender_id = st.selectbox(
+        "Profil à modifier",
+        [*sender_by_id, "__new__"],
+        format_func=lambda identifier: "➕ Ajouter un utilisateur" if identifier == "__new__" else sender_by_id[identifier]["name"],
+        key="edit_sender_id",
+    )
+    profile_to_edit = sender_by_id.get(edit_sender_id, {})
+    with st.form(f"sender_profile_form_{edit_sender_id}"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            profile_name = st.text_input("Nom de l'utilisateur *", value=profile_to_edit.get("name", ""))
+        with c2:
+            profile_role = st.text_input("Fonction / rôle", value=profile_to_edit.get("role", ""))
+        with c3:
+            profile_email = st.text_input("Email de signature", value=profile_to_edit.get("email", ""))
+        profile_context = st.text_area(
+            "Contexte personnel pour les lettres",
+            value=profile_to_edit.get("context", ""),
+            placeholder="Présentation, expérience, responsabilités, manière de s'adresser aux clients…",
+            help="Utilisé par l'IA pour écrire au nom de cette personne, en complément du contexte de la marque.",
+        )
+        if st.form_submit_button("💾 Enregistrer l'utilisateur"):
+            try:
+                profile = senders.validate_sender({
+                    "id": uuid4().hex if edit_sender_id == "__new__" else edit_sender_id,
+                    "name": profile_name,
+                    "role": profile_role,
+                    "email": profile_email,
+                    "context": profile_context,
+                })
+                sheets.save_sender_profile(profile)
+            except ValueError as e:
+                st.warning(str(e))
+            except Exception as e:
+                st.error(f"Impossible d'enregistrer l'utilisateur : {e}")
+            else:
+                load_sender_profiles_cached.clear()
+                st.session_state["pending_sender_id"] = profile["id"]
+                st.session_state["sender_saved"] = True
+                st.rerun()
+    if st.session_state.pop("sender_saved", False):
+        st.success("Utilisateur enregistré et sélectionné pour les prochains emails.")
+
+    st.divider()
     st.subheader("Informations sur l'entreprise / la marque")
     st.caption(
         "Ces infos servent à personnaliser TOUT ce que l'IA génère (les emails "
         "de prospection) — plus c'est précis, moins les messages "
-        "sont génériques. Elles servent aussi pour le titre de l'appli et la "
-        "signature des emails."
+        "sont génériques. Elles servent aussi pour le titre de l'appli."
     )
 
     if not (brand_settings.get("activity_description") or brand_settings.get("product_description")):
@@ -280,21 +366,6 @@ with tab_settings:
                 "Icône (emoji)", value=brand_settings.get("app_icon") or config.APP_ICON
             )
 
-        st.markdown("**Signature des emails**")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            f_sender_name = st.text_input(
-                "Nom", value=brand_settings.get("sender_name") or config.SENDER_NAME
-            )
-        with c2:
-            f_sender_role = st.text_input(
-                "Fonction", value=brand_settings.get("sender_role") or config.SENDER_ROLE
-            )
-        with c3:
-            f_sender_email = st.text_input(
-                "Email", value=brand_settings.get("sender_email") or config.SENDER_EMAIL
-            )
-
         st.markdown("**Délais de relance (en jours)**")
         c1, c2 = st.columns(2)
         with c1:
@@ -320,6 +391,7 @@ with tab_settings:
         if submitted:
             sheets.save_brand_settings(
                 {
+                    **brand_settings,
                     "company_name": f_company_name,
                     "tagline": f_tagline,
                     "activity_description": f_activity,
@@ -328,9 +400,6 @@ with tab_settings:
                     "tone_preferences": f_tone,
                     "app_title": f_app_title,
                     "app_icon": f_app_icon,
-                    "sender_name": f_sender_name,
-                    "sender_role": f_sender_role,
-                    "sender_email": f_sender_email,
                     "relance_delay_days": f_relance_days,
                     "sample_relance_delay_days": f_sample_days,
                     "minimal_design": "oui" if f_minimal_design else "non",
@@ -787,6 +856,9 @@ with tab_prospecting:
 # ---------------------------------------------------------------------------
 with tab_letters:
     st.subheader("Générer une lettre de prise de contact personnalisée")
+    st.caption(f"Lettre rédigée au nom de {active_sender['name']}.")
+    with st.expander("Signature de l'utilisateur actif"):
+        st.text(senders.signature(active_sender))
     st.caption(
         "Objet ET corps du message générés par Claude à partir du profil du "
         "client — relis toujours avant d'envoyer depuis ton client mail."
@@ -804,6 +876,11 @@ with tab_letters:
             format_func=lambda i: f"{i} — {eligible[eligible['id'] == i]['company'].values[0]}",
         )
         client = sheets.get_client_by_id(int(client_id), df=df)
+
+        draft_id = senders.draft_key(active_sender, int(client_id), brand_context)
+        drafts = st.session_state.setdefault("letter_drafts", {})
+        subject_widget = f"letter_subject_{draft_id}"
+        body_widget = f"letter_body_{draft_id}"
 
         try:
             images_df = load_images_df_cached()
@@ -830,20 +907,27 @@ with tab_letters:
         if st.button("✍️ Générer la lettre (objet + texte)"):
             with st.spinner("Génération en cours…"):
                 try:
-                    result = letters.generate_first_letter(client)
-                    st.session_state["draft_subject"] = result["subject"]
-                    st.session_state["draft_letter"] = result["body"]
+                    result = letters.generate_first_letter(client, sender=active_sender, brand_context=brand_context)
+                    drafts[draft_id] = result
+                    st.session_state.pop(subject_widget, None)
+                    st.session_state.pop(body_widget, None)
                 except Exception as e:
                     st.error(f"Erreur lors de la génération : {e}")
 
-        if "draft_letter" in st.session_state:
+        if draft_id in drafts:
             edited_subject = st.text_input(
                 "Objet de l'email (modifiable, généré automatiquement)",
-                value=st.session_state.get("draft_subject", ""),
+                value=drafts[draft_id]["subject"], key=subject_widget,
+                on_change=remember_draft_edit, args=(draft_id, "subject", subject_widget),
             )
-            edited = st.text_area("Texte de la lettre (modifiable)", value=st.session_state["draft_letter"], height=300)
+            edited = st.text_area(
+                "Texte de la lettre (modifiable)", value=drafts[draft_id]["body"], height=300,
+                key=body_widget, on_change=remember_draft_edit, args=(draft_id, "body", body_widget),
+            )
 
             st.markdown("**Envoyer depuis ton client mail**")
+            if active_sender.get("email"):
+                st.caption(f"Dans ton client mail, sélectionne aussi le compte expéditeur {active_sender['email']}.")
             c1, c2 = st.columns(2)
             with c1:
                 mailto_body = quote(edited)
@@ -870,9 +954,11 @@ with tab_letters:
                         "next_relance_date": add_days(today_str(), config.RELANCE_DELAY_DAYS),
                     },
                 )
-                sheets.log_message(int(client_id), client.get("company", ""), "Premier email", edited)
+                sender_label = active_sender["name"]
+                if active_sender.get("email"):
+                    sender_label += f" <{active_sender['email']}>"
+                sheets.log_message(int(client_id), client.get("company", ""), f"Premier email — {sender_label}", edited)
                 st.success(f"Marqué comme envoyé. Relance programmée dans {config.RELANCE_DELAY_DAYS} jours.")
-                del st.session_state["draft_letter"]
-                st.session_state.pop("draft_subject", None)
+                drafts.pop(draft_id, None)
                 refresh()
                 st.rerun()
