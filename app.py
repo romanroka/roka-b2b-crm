@@ -17,6 +17,7 @@ import streamlit as st
 from PIL import Image
 
 import config
+import followups
 import letters
 import prospecting
 import senders
@@ -43,6 +44,11 @@ def load_brand_settings_cached() -> dict:
 @st.cache_data(ttl=30, show_spinner=False)
 def load_sender_profiles_cached() -> list:
     return sheets.load_sender_profiles()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_followup_drafts_cached(context_key: str) -> dict:
+    return sheets.load_followup_drafts(context_key)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -200,6 +206,7 @@ def refresh():
     load_data.clear()
     load_brand_settings_cached.clear()
     load_sender_profiles_cached.clear()
+    load_followup_drafts_cached.clear()
     load_images_df_cached.clear()
     load_email_threads_df_cached.clear()
     load_search_log_df_cached.clear()
@@ -217,6 +224,10 @@ def add_days(date_str: str, days: int) -> str:
 
 def remember_draft_edit(draft_id: str, field: str, widget_key: str) -> None:
     st.session_state["letter_drafts"][draft_id][field] = st.session_state[widget_key]
+
+
+def remember_followup_edit(sequence_id: str, index: int, field: str, widget_key: str) -> None:
+    st.session_state["followup_drafts"][sequence_id][index][field] = st.session_state[widget_key]
 
 
 st.title(f"{config.APP_ICON} {config.APP_TITLE}")
@@ -855,7 +866,7 @@ with tab_prospecting:
 # TAB: Lettres
 # ---------------------------------------------------------------------------
 with tab_letters:
-    st.subheader("Générer une lettre de prise de contact personnalisée")
+    st.subheader("Premier email et 3 follow-ups personnalisés")
     st.caption(f"Lettre rédigée au nom de {active_sender['name']}.")
     with st.expander("Signature de l'utilisateur actif"):
         st.text(senders.signature(active_sender))
@@ -864,11 +875,12 @@ with tab_letters:
         "client — relis toujours avant d'envoyer depuis ton client mail."
     )
 
-    eligible = df[df["status"].isin(["Nouveau", "À qualifier", "À contacter"])] if not df.empty else df
+    letter_statuses = ["Nouveau", "À qualifier", "À contacter", *config.OPEN_STATUSES_FOR_RELANCE]
+    eligible = df[df["status"].isin(letter_statuses)] if not df.empty else df
     if eligible.empty:
         st.info(
             "Ajoute un prospect dans Clients ou Prospection, ou passe un client "
-            "au statut « À contacter » dans Clients pour préparer son premier email."
+            "au statut « À contacter » dans Clients. Les clients déjà contactés sont aussi disponibles pour les follow-ups."
         )
     else:
         client_id = st.selectbox(
@@ -962,3 +974,87 @@ with tab_letters:
                 drafts.pop(draft_id, None)
                 refresh()
                 st.rerun()
+
+        st.divider()
+        st.subheader("3 follow-ups")
+        st.caption(
+            "Une séquence à utiliser après le premier email : rappel amical, autre angle utile, puis clôture polie. "
+            "Relis chaque brouillon et adapte-le aux réponses reçues. Aucun envoi automatique."
+        )
+        sequences = st.session_state.setdefault("followup_drafts", {})
+        saved_sources = st.session_state.setdefault("followup_sources", {})
+        loaded_sequences = st.session_state.setdefault("loaded_followup_keys", set())
+        if draft_id not in loaded_sequences:
+            try:
+                saved_sequence = load_followup_drafts_cached(draft_id)
+                if saved_sequence:
+                    saved_sources[draft_id] = saved_sequence["first_letter"]
+                    saved_id = followups.context_key(draft_id, saved_sequence["first_letter"]["body"])
+                    sequences.setdefault(saved_id, saved_sequence["drafts"])
+                loaded_sequences.add(draft_id)
+            except Exception as e:
+                st.warning(f"Impossible de charger les follow-ups sauvegardés : {e}")
+
+        try:
+            message_history = sheets.get_messages_for_client(int(client_id), messages_df=load_messages_df_cached()).to_dict("records")
+        except Exception as e:
+            message_history = []
+            st.warning(f"Historique indisponible : {e}. La génération utilisera uniquement le premier email et la fiche client.")
+        sent_first_letters = [message for message in message_history if str(message.get("type", "")).startswith("Premier email")]
+        first_letter = drafts.get(draft_id) or saved_sources.get(draft_id)
+        if not first_letter:
+            first_letter = {
+                "subject": "",
+                "body": (sent_first_letters[-1].get("texte", "") if sent_first_letters else client.get("letter_text", "")) or "",
+            }
+        has_first_letter = bool(first_letter["body"].strip())
+        sequence_id = followups.context_key(draft_id, first_letter["body"])
+        if has_first_letter:
+            with st.expander("Premier email utilisé comme contexte"):
+                if first_letter.get("subject"):
+                    st.text(first_letter["subject"])
+                st.text(first_letter["body"])
+        else:
+            st.info("Génère d'abord le premier email ci-dessus, puis génère les 3 follow-ups.")
+
+        if st.button("✍️ Générer les 3 follow-ups", disabled=not has_first_letter):
+            with st.spinner("Génération des trois follow-ups…"):
+                try:
+                    result = letters.generate_followups(
+                        client, first_letter, sender=active_sender,
+                        brand_context=brand_context, history=message_history,
+                    )
+                    sequences[sequence_id] = result
+                    for index in range(3):
+                        for field in ("subject", "body"):
+                            st.session_state.pop(f"followup_{field}_{sequence_id}_{index}", None)
+                except Exception as e:
+                    st.error(f"Erreur lors de la génération des follow-ups : {e}")
+
+        if sequence_id in sequences:
+            if active_sender.get("email"):
+                st.caption(f"Dans ton client mail, sélectionne le compte expéditeur {active_sender['email']}.")
+            for index, title in enumerate(("Rappel amical", "Un autre angle", "Clôture polie")):
+                with st.expander(f"Follow-up {index + 1} — {title}", expanded=True):
+                    subject_key = f"followup_subject_{sequence_id}_{index}"
+                    body_key = f"followup_body_{sequence_id}_{index}"
+                    fu_subject = st.text_input(
+                        f"Objet du follow-up {index + 1}", value=sequences[sequence_id][index]["subject"], key=subject_key,
+                        on_change=remember_followup_edit, args=(sequence_id, index, "subject", subject_key),
+                    )
+                    fu_body = st.text_area(
+                        f"Texte du follow-up {index + 1}", value=sequences[sequence_id][index]["body"], height=220, key=body_key,
+                        on_change=remember_followup_edit, args=(sequence_id, index, "body", body_key),
+                    )
+                    st.link_button(
+                        f"📧 Ouvrir le follow-up {index + 1} dans mon client mail",
+                        f"mailto:{client.get('email', '')}?subject={quote(fu_subject)}&body={quote(fu_body)}",
+                    )
+            if st.button("💾 Sauvegarder les 3 follow-ups"):
+                try:
+                    sheets.save_followup_drafts(draft_id, int(client_id), active_sender["id"], first_letter, sequences[sequence_id])
+                    saved_sources[draft_id] = dict(first_letter)
+                    load_followup_drafts_cached.clear(draft_id)
+                    st.success("Les 3 follow-ups et leur premier email de référence sont sauvegardés. Statut et historique d'envoi inchangés.")
+                except Exception as e:
+                    st.error(f"Impossible de sauvegarder les follow-ups : {e}")
