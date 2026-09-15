@@ -2,8 +2,9 @@
 """
 Генерация текста писем на французском через Claude API.
 
-Два сценария:
+Сценарии:
     generate_first_letter(client) -> первое письмо клиенту
+    generate_followups(client, first_letter) -> цепочка из трёх follow-up писем
     generate_relance(client)      -> вежливый реланс через N дней без ответа
 
 Тон и правила бренда живут в config.BRAND_CONTEXT — если хочешь поменять стиль
@@ -14,6 +15,7 @@ import anthropic
 from typing import Optional
 
 import config
+import followups
 import senders
 
 
@@ -174,6 +176,56 @@ SUJET: <objet ici>
     text = _extract_text(message)
     fallback_subject = f"ROKA — café spécialité pour {client.get('company', '')}".strip()
     return _with_signature(_parse_subject_and_body(text, fallback_subject), sender)
+
+
+def generate_followups(client: dict, first_letter: dict, sender: Optional[dict] = None,
+                       brand_context: Optional[str] = None, history: Optional[list] = None) -> list:
+    """Generate a coherent sequence in one request, without sending any email."""
+    first_letter = followups.validate_first_letter(first_letter)
+    sender = senders.legacy_sender({}) if sender is None else sender
+    brand_context = config.BRAND_CONTEXT if brand_context is None else brand_context
+    system_prompt = f"""Prépare exactement trois emails de suivi B2B successifs en français.
+
+{brand_context}
+
+{_sender_context(sender)}
+
+Ces brouillons seront utilisés après le premier email si le destinataire ne répond pas.
+1. Follow-up 1 : rappel amical et léger de la proposition, avec une question simple.
+2. Follow-up 2 : un autre angle utile au destinataire, fondé uniquement sur les faits
+   fournis (usage concret, bénéfice pertinent, possibilité d'un échange).
+3. Follow-up 3 : clôture polie et courte, sans pression, en laissant la porte ouverte.
+Les trois emails doivent être différents : ne répète ni le premier email ni les mêmes
+arguments ou appels à l'action. Tiens compte de l'historique réel fourni.
+N'invente pas de réponse, de rendez-vous, d'échantillons déjà envoyés, de remise,
+de promesse commerciale, de date ou de délai écoulé. Le statut du client fait foi.
+Chaque email fait environ 50 à 90 mots, avec un objet de moins de 60 caractères.
+Pas de signature : elle sera ajoutée par l'application.
+Réponds uniquement avec un tableau JSON de trois objets dans l'ordre, sans Markdown :
+[{{"subject": "...", "body": "..."}}, {{"subject": "...", "body": "..."}}, {{"subject": "...", "body": "..."}}]"""
+    recent_history = "\n\n".join(
+        f"{message.get('date', '')} — {message.get('type', '')}\n{str(message.get('texte', ''))[:4000]}"
+        for message in (history or [])[-6:]
+    ) or "Aucun historique supplémentaire."
+    user_prompt = f"""Prospect :
+{_client_context(client)}
+Statut actuel : {client.get('status', '')}
+
+Premier email de référence (rédigé ou déjà envoyé) :
+Objet : {first_letter.get('subject', '')}
+{first_letter['body']}
+
+Historique réel des messages déjà envoyés :
+{recent_history}
+
+Prépare les follow-ups 1, 2 et 3 au nom de {sender.get('name', '')}."""
+    response = _get_anthropic_client().messages.create(
+        model=config.CLAUDE_MODEL,
+        max_tokens=2400,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    return [_with_signature(draft, sender) for draft in followups.parse(_extract_text(response))]
 
 
 def generate_relance(client: dict, sender: Optional[dict] = None, brand_context: Optional[str] = None) -> dict:

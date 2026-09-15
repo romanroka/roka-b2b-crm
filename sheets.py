@@ -35,6 +35,7 @@
     find_or_create_client_for_email(email, display_name)
 """
 
+import json
 import time
 from datetime import datetime
 from typing import Optional
@@ -45,6 +46,7 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 
 import config
+import followups
 import senders
 
 SCOPES = [
@@ -80,6 +82,9 @@ CONFIG_HEADER = ["cle", "valeur"]
 
 SENDERS_WORKSHEET = "Utilisateurs"
 SENDERS_COLUMNS = ["id", "name", "role", "email", "context"]
+
+FOLLOWUPS_WORKSHEET = "FollowUps"
+FOLLOWUPS_COLUMNS = ["context_key", "client_id", "sender_id", "first_email_json", "drafts_json", "updated_at"]
 
 # Historique complet des messages envoyés à chaque client (un quatrième
 # onglet) — contrairement à client["letter_text"] qui ne garde que le
@@ -387,6 +392,43 @@ def save_sender_profile(profile: dict) -> None:
     for row_number, identifier in enumerate(ids[1:], start=2):
         if str(identifier) == profile["id"]:
             ws.update(range_name=f"A{row_number}:E{row_number}", values=[row], value_input_option="RAW")
+            return
+    ws.append_row(row, value_input_option="RAW")
+
+
+def load_followup_drafts(context_key: str) -> dict:
+    """Read the saved sequence for this client and sender/profile revision."""
+    try:
+        ws = _get_spreadsheet().worksheet(FOLLOWUPS_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        return {}
+    for record in ws.get_all_records():
+        if record.get("context_key") == context_key:
+            return {
+                "first_letter": followups.validate_first_letter(json.loads(record.get("first_email_json") or "{}")),
+                "drafts": followups.parse(record.get("drafts_json") or ""),
+            }
+    return {}
+
+
+def save_followup_drafts(context_key: str, client_id: int, sender_id: str, first_letter: dict, sequence: list) -> None:
+    """Save the three drafts separately from client status and sent-message history."""
+    serialized = json.dumps(followups.validate(sequence), ensure_ascii=False)
+    first_serialized = json.dumps(followups.validate_first_letter(first_letter), ensure_ascii=False)
+    if max(len(serialized), len(first_serialized)) > 45000:
+        raise ValueError("Les textes sont trop longs pour être enregistrés. Raccourcis les follow-ups.")
+    spreadsheet = _get_spreadsheet()
+    try:
+        ws = spreadsheet.worksheet(FOLLOWUPS_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=FOLLOWUPS_WORKSHEET, rows=1000, cols=len(FOLLOWUPS_COLUMNS))
+        ws.append_row(FOLLOWUPS_COLUMNS, value_input_option="RAW")
+    if not ws.row_values(1):
+        ws.append_row(FOLLOWUPS_COLUMNS, value_input_option="RAW")
+    row = [context_key, int(client_id), sender_id, first_serialized, serialized, datetime.now().isoformat(timespec="seconds")]
+    for row_number, key in enumerate(ws.col_values(1)[1:], start=2):
+        if key == context_key:
+            ws.update(range_name=f"A{row_number}:F{row_number}", values=[row], value_input_option="RAW")
             return
     ws.append_row(row, value_input_option="RAW")
 

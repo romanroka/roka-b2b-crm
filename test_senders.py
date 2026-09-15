@@ -85,7 +85,7 @@ class SenderLogicTests(unittest.TestCase):
         ws.append_row.assert_called_with([EVA[key] for key in sheets.SENDERS_COLUMNS], value_input_option="RAW")
 
 
-class SenderInterfaceTests(unittest.TestCase):
+class SenderAppHarness(unittest.TestCase):
     def setUp(self):
         st.cache_data.clear()
         self.stack = ExitStack()
@@ -97,12 +97,14 @@ class SenderInterfaceTests(unittest.TestCase):
             row = dict.fromkeys(config.CLIENT_COLUMNS, "")
             row.update(id=identifier, company=f"Hôtel {identifier}", email=f"hotel{identifier}@example.com", status="Nouveau", relance_count=0)
             clients.append(row)
+        self.clients = pd.DataFrame(clients, columns=config.CLIENT_COLUMNS)
+        self.messages = pd.DataFrame(columns=sheets.MESSAGES_COLUMNS)
         values = {
             "load_brand_settings": self.brand,
-            "load_clients_df": pd.DataFrame(clients, columns=config.CLIENT_COLUMNS),
+            "load_clients_df": self.clients,
             "load_images_df": pd.DataFrame(columns=sheets.IMAGES_COLUMNS),
             "load_search_log_df": pd.DataFrame(columns=sheets.SEARCH_LOG_COLUMNS),
-            "load_messages_df": pd.DataFrame(columns=sheets.MESSAGES_COLUMNS),
+            "load_messages_df": self.messages,
             "load_email_threads_df": pd.DataFrame(columns=sheets.EMAIL_THREADS_COLUMNS),
             "load_all_email_messages_df": pd.DataFrame(columns=sheets.EMAIL_MESSAGES_COLUMNS),
         }
@@ -113,6 +115,9 @@ class SenderInterfaceTests(unittest.TestCase):
         self.save_brand = self.stack.enter_context(patch.object(sheets, "save_brand_settings"))
         self.update_client = self.stack.enter_context(patch.object(sheets, "update_client"))
         self.log_message = self.stack.enter_context(patch.object(sheets, "log_message"))
+        self.saved_followups = {}
+        self.load_followups = self.stack.enter_context(patch.object(sheets, "load_followup_drafts", side_effect=lambda key: copy.deepcopy(self.saved_followups.get(key, {}))))
+        self.save_followups = self.stack.enter_context(patch.object(sheets, "save_followup_drafts", side_effect=self.store_followups))
         self.storage = self.stack.enter_context(patch.object(sheets, "_get_spreadsheet", side_effect=AssertionError("No live storage calls")))
         self.api = MagicMock()
         self.api.messages.create.return_value = RESPONSE
@@ -123,6 +128,9 @@ class SenderInterfaceTests(unittest.TestCase):
 
     def store_profile(self, profile):
         self.profiles[:] = [row for row in self.profiles if row["id"] != profile["id"]] + [copy.deepcopy(profile)]
+
+    def store_followups(self, key, client_id, sender_id, first_letter, sequence):
+        self.saved_followups[key] = copy.deepcopy({"first_letter": first_letter, "drafts": sequence})
 
     def app(self):
         return self.healthy(AppTest.from_file(str(Path(__file__).with_name("app.py")), default_timeout=15).run())
@@ -139,6 +147,8 @@ class SenderInterfaceTests(unittest.TestCase):
         self.healthy(app)
         return self.item(app.tabs[3].text_area, "Texte de la lettre (modifiable)")
 
+
+class SenderInterfaceTests(SenderAppHarness):
     def test_switching_users_and_clients_preserves_separate_edited_drafts(self):
         app = self.app()
         roman = self.generate(app)
